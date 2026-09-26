@@ -1,5 +1,7 @@
 # REPLAN MVP
 
+> **처음이라면**: [인수인계 요약(HANDOFF.md)](docs/HANDOFF.md) · [데모 가이드(DEMO_GUIDE.md)](docs/DEMO_GUIDE.md)
+
 REPLAN은 설비 도입처럼 일정 의존성이 큰 프로젝트에서 **변경 신호를 근거와 함께 검토하고, 대응안을 계산·승인·반영하는 단일 팀용 작업공간**입니다.
 
 협력사, 공공기관, 문서 작성자는 이 서비스의 사용자가 아닙니다. 프로젝트 운영팀이 하나의 공용 계정으로 기준 일정과 프로젝트 근거를 관리합니다.
@@ -129,5 +131,6 @@ cd apps/web && npm run build
 - [연동 매트릭스](docs/INTEGRATION_MATRIX.md): 현재 연동과 운영 전제
 - [AWS 배포 안내](deploy/aws/README.md): EC2·Docker Compose 배포 및 운영 확인
 - [데모 가이드](docs/DEMO_GUIDE.md): 대표 시나리오 재생 순서
+- [인수인계 요약](docs/HANDOFF.md): 서비스 요약, X2 실행법, 알려진 한계
 
 현재 MVP는 공용 팀 계정과 SQLite를 전제로 합니다. 인터넷 공개 운영 전에는 팀 인증, 비밀 관리, HTTPS, 백업·영속 볼륨, 운영 감시를 추가해야 합니다. 외부 공지와 문서는 일정 변경을 확정하지 않으며, 규제·인허가 정보는 사람의 적용 확인 전까지 조건부 검토 사건으로만 다룹니다.
