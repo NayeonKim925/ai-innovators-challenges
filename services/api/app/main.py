@@ -1160,6 +1160,17 @@ def validate_external_approval(db: Store, scenario: dict[str, Any]) -> None:
             raise HTTPException(409, "변경 해석이 수정되었습니다. 다시 분석하세요")
         if current.get("version_id") != scenario["version_id"]:
             raise HTTPException(409, "외부 근거의 기준 일정이 바뀌었습니다")
+        proof = current.get("evidence") or {}
+        document_id = str(proof.get("document_id") or "")
+        if document_id:
+            document = db.get_json("evidence_documents", document_id, scenario["project_id"])
+            if not document or document["data"].get("content_hash") != proof.get("document_hash"):
+                raise HTTPException(409, "외부 근거 문서가 바뀌었거나 확인할 수 없습니다. 다시 분석하세요")
+        snapshot_id = str(proof.get("snapshot_id") or "")
+        if snapshot_id and not document_id:
+            snapshot = db.get_json("source_snapshots", snapshot_id, scenario["project_id"])
+            if snapshot and proof.get("content_hash") and snapshot.get("body_hash") != proof.get("content_hash"):
+                raise HTTPException(409, "외부 출처가 갱신되었습니다. 다시 분석하세요")
     context = db.project_context_snapshot(scenario["project_id"])
     if data.get("project_context_hash") != context["content_hash"]:
         raise HTTPException(409, "달력 또는 운영 조건이 바뀌었습니다. 다시 분석하세요")

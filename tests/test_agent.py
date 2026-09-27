@@ -26,6 +26,7 @@ def test_run_agent_returns_llm_unavailable_without_api_key(monkeypatch):
     result = run_agent({}, {"content": "일정 영향 확인"}, {"inspect_task": inspect_task})
 
     assert result["status"] == "llm_unavailable"
+    assert "LLM 연결 설정" in result["summary"]
     assert result["tool_log"] == []
     assert calls == []
 
@@ -381,7 +382,7 @@ def test_llm_gateway_requires_explicit_model_and_base_url(monkeypatch):
     result = run_agent({}, {"content": "일정 영향 확인"}, {})
 
     assert result["status"] == "llm_unavailable"
-    assert "LLM_MODEL is not configured" in result["unresolved_items"]
+    assert any("LLM 연결 설정" in item for item in result["unresolved_items"])
 
 
 def test_llm_gateway_retries_400_without_unsupported_fields():

@@ -486,6 +486,17 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
     if state["usage"]:
         output["usage"] = {key: (output["usage"].get(key, 0) + value if isinstance(value, (int, float)) else value)
                            for key, value in {**output["usage"], **state["usage"]}.items()} if output.get("usage") else state["usage"]
+    # A gateway outage is not an M5 ("cannot calculate") result. The deterministic schedule calculation
+    # already completed before this optional investigation, so retain it and offer a meaningful retry state.
+    if output.get("status") == "llm_unavailable":
+        event["investigation"] = {"run_id": run["id"], "stop": "llm_unavailable", "summary": output.get("summary"),
+                                  "question": "", "at": utcnow()}
+        db.put_json("events", event_row["id"], event, project_id=run["project_id"],
+                    fingerprint=event_row["fingerprint"], created_at=event_row["created_at"])
+        return {"status": "llm_unavailable", "summary": output.get("summary"), "agent": output,
+                "action_ids": [], "related_signals": signals, "real_case_basis": [], "agent_found_cases": [],
+                "rules_only": {"finish_date": reported.get("finish_date"), "scope": "통보 내용만 계산"},
+                "linked_notices": [], "notify": True}
     record = output.get("investigation") or {"stop": "M5"}
     stop = record["stop"]
     # A question about an item that cannot absorb the hold must carry the date to act by.
@@ -627,7 +638,7 @@ def _run_analysis(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         return {"status": "SUPERSEDED", "summary": "보류되었거나 최신 근거로 대체된 변경입니다.", "scenario_ids": []}
     if event.get("version_id") and event["version_id"] != version["id"]:
         return {"status": "STALE", "summary": "기준 일정이 바뀌었습니다. 외부 소스를 다시 확인하세요.", "scenario_ids": []}
-    if not event.get("patch") and event.get("channel") == "registered_public_source":
+    if not event.get("patch") and event.get("evidence") and event.get("channel") in {"registered_public_source", "evidence_document"}:
         # Interpret source evidence before the early NEEDS_INPUT return.
         if interpret_llm:
             paid_state = _reserve_paid_attempt(db, run["id"])
@@ -637,7 +648,7 @@ def _run_analysis(db: Store, run: dict[str, Any]) -> dict[str, Any]:
                 result = interpret_notice(event, tasks, OpenAICompatibleLLM())
                 _record_usage(db, run["id"], result)
                 paid_reserved = True
-                supplier_agent = _interpretation_agent(result, "공지")
+                supplier_agent = _interpretation_agent(result, "외부 근거")
                 event["interpretation"] = result
                 if result.get("candidates"):
                     event["candidates"] = result["candidates"]
@@ -841,14 +852,35 @@ def _run_document_ingest(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         version = db.current_version(run["project_id"])
         if version and parsed.get("text", "").strip():
             project = db.get_json("projects", run["project_id"])
-            raw = {
-                "channel": "email" if parsed["input_type"] == "email" else "document",
-                "source_label": record.get("filename") or "문서 입력",
-                "content": parsed["text"],
-                "mode": project["data"].get("mode", "LIVE") if project else "LIVE",
-                "data_origin": "USER",
-            }
-            event = normalize_event(raw, project["data"] if project else {}, version["data"]["tasks"])
+            if parsed["input_type"] == "email":
+                raw = {
+                    "channel": "email", "source_label": record.get("filename") or "문서 입력",
+                    "content": parsed["text"],
+                    "mode": project["data"].get("mode", "LIVE") if project else "LIVE",
+                    "data_origin": "USER",
+                }
+                event = normalize_event(raw, project["data"] if project else {}, version["data"]["tasks"])
+            else:
+                from .evidence_rag import ground_external_source
+
+                watch = db.get_json("watch_plans", run["project_id"])
+                source = {
+                    "source_id": f"uploaded-document:{document_id}", "url": f"document://{document_id}",
+                    "title": record.get("filename") or "등록 문서", "content": parsed["text"],
+                    "body_hash": record.get("sha256"), "fetched_at": record["processed_at"],
+                }
+                proof, matched = ground_external_source(
+                    db, run["project_id"], source, tasks=version["data"]["tasks"],
+                    watch_plan=watch["data"] if watch else {}, evidence_kind="UPLOADED_DOCUMENT",
+                    snapshot_id=None, origin="USER_DOCUMENT",
+                )
+                event = {
+                    "channel": "evidence_document", "source_label": record.get("filename") or "문서 입력",
+                    "title": source["title"], "content": parsed["text"],
+                    "mode": project["data"].get("mode", "LIVE") if project else "LIVE",
+                    "data_origin": "USER_DOCUMENT", "version_id": version["id"],
+                    "evidence": proof, **matched,
+                }
             fingerprint = digest({"document_id": document_id, "text": parsed["text"]})
             existing_event = db.find_event_by_fingerprint(run["project_id"], fingerprint)
             if existing_event:
@@ -984,14 +1016,28 @@ def _record_public_risks(db: Store, project_id: str, plan: dict, result: dict, s
         source = {**row, "content": row.get("content") or row.get("summary") or row.get("title", ""),
                   "url": row.get("url") or url, "feed_url": url,
                   "source_id": result.get("source_id"), "fetched_at": result.get("fetched_at")}
+        source["snapshot_source_id"] = source.get("source_id")
         source["body_hash"] = digest({"title": source.get("title"), "content": source["content"]})
         identity = row.get("id") or row.get("url") or row.get("title") or url
+        if data_origin == "SYNTHETIC":
+            # Cassette-backed demo events retain their original payload and never enter the live RAG index.
+            proof = evidence(source, snapshot_id, "PUBLIC_NOTICE")
+            matched = match_notice(source, version["data"]["tasks"], plan.get("source_rules", []))
+        else:
+            from .evidence_rag import ground_external_source
+
+            source["source_id"] = f"{source.get('source_id') or url}:{digest(identity)[:12]}"
+            proof, matched = ground_external_source(
+                db, project_id, source, tasks=version["data"]["tasks"], watch_plan=plan,
+                evidence_kind="PUBLIC_NOTICE", snapshot_id=snapshot_id, origin=data_origin,
+            )
+            proof["snapshot_source_id"] = source["snapshot_source_id"]
         event = {
             "title": source.get("title") or "등록 출처의 새 공지",
             "content": source["content"], "source_label": source["url"],
             "channel": "registered_public_source",
-            "evidence": evidence(source, snapshot_id, "PUBLIC_NOTICE"),
-            **match_notice(source, version["data"]["tasks"], plan.get("source_rules", [])),
+            "evidence": proof,
+            **matched,
         }
         if row.get("published_at"):
             event["published_at"] = row["published_at"]

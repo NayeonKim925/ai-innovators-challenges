@@ -59,8 +59,7 @@ def run_agent(
         try:
             reply = gateway.chat(messages, tools=tool_schemas, response_format={"type": "json_object"})
         except LLMUnavailable as exc:
-            return _result(status="llm_unavailable", summary="LLM agent is unavailable because the gateway cannot be reached.",
-                           unresolved_items=[str(exc)], tool_log=tool_log, usage=usage)
+            return {**_unavailable(str(exc)), "tool_log": tool_log, "usage": usage}
         except Exception as exc:  # pragma: no cover - exercised through runtime behavior, exact clients vary.
             return _result(
                 status="failed",
@@ -647,10 +646,20 @@ def _result(
 
 
 def _unavailable(reason: str) -> Dict[str, Any]:
+    """Return a user-actionable status without treating an LLM outage as a schedule failure."""
+    normalized = reason.lower()
+    if "api_key" in normalized or "llm_model" in normalized or "llm_base_url" in normalized:
+        message = "LLM 연결 설정이 완성되지 않았습니다. API 키, 모델, 게이트웨이 주소를 확인하세요."
+    elif "replay miss" in normalized:
+        message = "현재 입력에 맞는 데모 응답이 없습니다. 실제 LLM 모드로 전환하거나 데모 입력을 사용하세요."
+    elif "choices" in normalized:
+        message = "LLM 게이트웨이가 사용할 수 있는 응답을 보내지 않았습니다. 모델 또는 게이트웨이 설정을 확인하세요."
+    else:
+        message = "LLM 게이트웨이에 연결할 수 없습니다. 잠시 후 다시 시도하세요. 일정 계산 결과는 유지됩니다."
     return _result(
         status="llm_unavailable",
-        summary="LLM agent is unavailable because API_KEY is not configured or the gateway cannot be reached.",
-        unresolved_items=[reason],
+        summary=message,
+        unresolved_items=[message],
     )
 
 

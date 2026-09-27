@@ -108,6 +108,22 @@ class Store:
                     body_hash TEXT, status TEXT NOT NULL, data TEXT NOT NULL, fetched_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS source_by_project ON source_snapshots(project_id, source_id, fetched_at);
+                CREATE TABLE IF NOT EXISTS evidence_documents (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, source_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_id, content_hash)
+                );
+                CREATE INDEX IF NOT EXISTS evidence_document_by_project ON evidence_documents(project_id, created_at);
+                CREATE TABLE IF NOT EXISTS evidence_passages (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, document_id TEXT NOT NULL,
+                    passage_hash TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(document_id, passage_hash)
+                );
+                CREATE INDEX IF NOT EXISTS evidence_passage_by_project ON evidence_passages(project_id, document_id, created_at);
+                CREATE TABLE IF NOT EXISTS retrieval_runs (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS retrieval_run_by_project ON retrieval_runs(project_id, created_at);
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     data TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -170,6 +186,9 @@ class Store:
             "versions": ("id", "project_id", "parent_id", "status", "content_hash", "data", "created_at"),
             "watch_plans": ("project_id", "data", "updated_at"),
             "source_snapshots": ("id", "project_id", "source_id", "body_hash", "status", "data", "fetched_at"),
+            "evidence_documents": ("id", "project_id", "source_id", "content_hash", "data", "created_at"),
+            "evidence_passages": ("id", "project_id", "document_id", "passage_hash", "data", "created_at"),
+            "retrieval_runs": ("id", "project_id", "data", "created_at"),
             "events": ("id", "project_id", "fingerprint", "data", "created_at"),
             "scenarios": ("id", "project_id", "run_id", "version_id", "data", "created_at"),
             "actions": ("id", "project_id", "event_id", "scenario_id", "data", "created_at"),
@@ -198,7 +217,7 @@ class Store:
             )
 
     def get_json(self, table: str, record_id: str, project_id: str | None = None) -> dict[str, Any] | None:
-        if table not in {"projects", "imports", "versions", "watch_plans", "source_snapshots", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
+        if table not in {"projects", "imports", "versions", "watch_plans", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
             raise ValueError("unsupported table")
         key = "project_id" if table == "watch_plans" else "id"
         query = f"SELECT * FROM {table} WHERE {key}=?"
@@ -215,7 +234,7 @@ class Store:
         return result
 
     def list_json(self, table: str, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
-        if table not in {"versions", "source_snapshots", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
+        if table not in {"versions", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
             raise ValueError("unsupported table")
         order_column = "updated_at" if table == "runs" else "created_at"
         if table == "source_snapshots":
@@ -246,6 +265,19 @@ class Store:
                 item["data"] = data
                 return item
         return None
+
+    def find_evidence_document(self, project_id: str, source_id: str, content_hash: str) -> dict[str, Any] | None:
+        """Find an immutable evidence document without re-indexing identical source content."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM evidence_documents WHERE project_id=? AND source_id=? AND content_hash=?",
+                (project_id, source_id, content_hash),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["data"] = json.loads(item["data"])
+        return item
 
     def find_event_by_fingerprint(self, project_id: str, fingerprint: str) -> dict[str, Any] | None:
         with self.connection() as db:

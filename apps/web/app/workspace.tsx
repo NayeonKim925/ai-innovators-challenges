@@ -1126,7 +1126,7 @@ function ChangeCard({ event, tasks, taskNames, busy, isFocus, runs, investigatio
 
 const STOP_LABEL: Record<string, string> = {
   M1: "관련 없음 · 기록만", M2: "완료일 영향 없음 · 기록만", M3: "확인이 필요합니다 · 기간", M4: "확인이 필요합니다",
-  M5: "계산할 수 없음", done: "대응안 비교 완료",
+  M5: "계산 조건 확인 필요", llm_unavailable: "에이전트 연결 확인 필요", done: "대응안 비교 완료",
 };
 const CHECK_LABEL: Record<string, string> = {
   find_procurement_items: "구매 품목 찾기", check_schedule_slack: "여유 계산", simulate_conditional: "조건부 일정 계산",
