@@ -106,5 +106,7 @@ def advance_linked(db: Store, project_id: str, event_id: str, status: str, actor
 
 def model_view(db: Store, project_id: str) -> list[dict[str, Any]]:
     """What an agent reads before judging a new signal: the cause and scope, not status or history."""
-    return [{key: risk.get(key) for key in ("risk_id", "title", "cause", "task_ids", "item_ids")}
+    return [{**{key: risk.get(key) for key in ("risk_id", "title", "cause", "task_ids", "item_ids")},
+             **({"linked_cause": {key: risk["linked_cause"].get(key) for key in ("text", "case_ids")}}
+                if risk.get("linked_cause") else {})}
             for risk in list_risks(db, project_id) if risk.get("status") != "CLOSED"]

@@ -107,6 +107,7 @@ def normalize_import_snapshot(parsed: dict[str, Any], current_project: dict[str,
         profile["mode"] = "REPLAY"
         profile["data_origin"] = "SYNTHETIC"
         profile["status_as_of"] = hero["as_of_date"]
+        profile["evidence_as_of"] = hero.get("evidence_as_of_date") or hero["as_of_date"]
         profile["hero_fixture_id"] = hero["project_id"]
     calendars = overrides.calendars if overrides.calendars is not None else parsed.get("calendars", [])
     profile["nonworking_dates"] = [item.get("calendar_date") for item in calendars if item.get("scope") == profile.get("site_id") and item.get("calendar_date")]
@@ -701,14 +702,54 @@ async def import_hero_demo_baseline(project_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/demo/external-signals/{signal_id}", dependencies=[Depends(authorize)])
 def load_demo_signal(project_id: str, signal_id: str) -> dict[str, Any]:
-    """Record a bundled synthetic notice exactly as a registered-source scan would."""
-    from .hero_demo import HERO_PROJECT_ID, loop_notice
-    from .worker import _record_public_risks, _store_source_snapshot
-
+    """Record one bundled synthetic notice exactly as a registered-source scan would (test notices)."""
     db = store()
+    _require_hero(db, project_id)
+    created = _record_demo_signal(db, project_id, signal_id)
+    return {"event_ids": created, "duplicate": not created}
+
+
+# What the simulated collection of the hero demo finds when a person starts the watch.
+DEMO_WATCH_SIGNALS = ("N-X2",)
+
+
+@app.post("/api/projects/{project_id}/watch/start", dependencies=[Depends(authorize)])
+def start_watch(project_id: str) -> dict[str, Any]:
+    """Start the watch: the hero demo simulates one collection, other projects scan their enabled plan."""
+    db = store()
+    project = project_or_404(db, project_id)
+    if not db.current_version(project_id):
+        raise HTTPException(409, "confirm a baseline first")
+    from .hero_demo import HERO_PROJECT_ID
+
+    if project["data"].get("hero_fixture_id") == HERO_PROJECT_ID:
+        created = [event_id for signal_id in DEMO_WATCH_SIGNALS for event_id in _record_demo_signal(db, project_id, signal_id)]
+        mode, run_id = "demo_simulation", None
+    else:
+        watch = db.get_json("watch_plans", project_id)
+        if not watch or not watch["data"].get("enabled"):
+            raise HTTPException(409, "watch plan is disabled")
+        run = db.create_run(project_id, "scan", None, None, f"watch-start:{utcnow()}", {"watch_plan": watch["data"]})
+        created, mode, run_id = [], "scan", run["id"]
+    started = project["data"].get("watch_started_at") or utcnow()
+    db.put_json("projects", project_id, {**project["data"], "watch_started_at": started, "watch_mode": mode},
+                created_at=project["created_at"])
+    return {"mode": mode, "event_ids": created, "run_id": run_id, "watch_started_at": started}
+
+
+def _require_hero(db: Store, project_id: str) -> dict[str, Any]:
+    from .hero_demo import HERO_PROJECT_ID
+
     project = project_or_404(db, project_id)
     if not db.current_version(project_id) or project["data"].get("hero_fixture_id") != HERO_PROJECT_ID:
         raise HTTPException(409, "합성 외부 공지는 hero 데모 기준 일정에서만 불러올 수 있습니다")
+    return project
+
+
+def _record_demo_signal(db: Store, project_id: str, signal_id: str) -> list[str]:
+    from .hero_demo import loop_notice
+    from .worker import _record_public_risks, _store_source_snapshot
+
     notice = loop_notice(signal_id)
     if not notice:
         raise HTTPException(404, "signal not found")
@@ -724,7 +765,7 @@ def load_demo_signal(project_id: str, signal_id: str) -> dict[str, Any]:
         row = db.get_json("events", event_id, project_id)
         db.put_json("events", event_id, {**row["data"], "demo_signal_id": signal_id}, project_id=project_id,
                     fingerprint=row["fingerprint"], created_at=row["created_at"])
-    return {"event_ids": created, "duplicate": not created}
+    return created
 
 
 @app.post("/api/projects/{project_id}/imports", dependencies=[Depends(authorize)])

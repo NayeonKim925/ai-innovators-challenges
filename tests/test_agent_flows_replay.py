@@ -53,13 +53,13 @@ def test_every_recorded_flow_replays_in_any_project(tmp_path, monkeypatch):
 
     # The baseline briefing, the change triage and the register link replay as recorded.
     brief = runs["BRIEF"]["briefing"]
-    assert brief["risks"][0]["risk_id"] == "R-import-licence-CN" and brief["risks"][0]["item_ids"] == ["P-A1", "P-B", "P-C"]
+    assert brief["risks"][0]["risk_id"] == "R-import-CN" and brief["risks"][0]["item_ids"] == ["P-A1", "P-B", "P-C"]
     assert any(warning.startswith("P-C: 여유 0일") for warning in brief["risks"][0]["critical_warnings"])
     triage = runs["X2"]["triage"]
     assert triage["status"] == "interpreted" and "T051" in triage["related"]
-    assert triage["risk_links"] == ["R-import-licence-CN"]
+    assert triage["risk_links"] == ["R-import-CN"]
     link = x2["risk_link"]
-    assert link["risk_id"] == "R-import-licence-CN" and link["status"] == "OCCURRED" and link["expected_by"] == "briefing"
+    assert link["risk_id"] == "R-import-CN" and link["status"] == "OCCURRED" and link["expected_by"] == "briefing"
     assert runs["X2-C"]["investigation"]["risk_link"] is None
     # A notice is investigated on its related tasks only; needs-check tasks wait for a person.
     x1b = runs["X1-B"]["investigation"]["agent"]["tool_log"]

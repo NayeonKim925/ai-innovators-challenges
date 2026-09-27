@@ -76,15 +76,18 @@ def test_rules_brief_the_rare_earth_items_with_a_critical_path_warning(client):
     risks = briefing["risks"]
     assert 3 <= len(risks) <= 5
     first = risks[0]
-    assert first["risk_id"] == "R-import-licence-CN" and first["item_ids"] == ["P-A1", "P-B", "P-C"]
+    assert first["risk_id"] == "R-import-CN" and first["item_ids"] == ["P-A1", "P-B", "P-C"]
     by_item = {row["item_id"]: row for row in first["items"]}
     assert by_item["P-C"]["float_days"] == 0 and by_item["P-C"]["vulnerability"]["label"] == "여유 0일이라 취약 (주공정)"
     assert by_item["P-B"]["float_days"] == 245
     assert any(warning.startswith("P-C: 여유 0일이라 취약합니다(주공정)") for warning in first["critical_warnings"])
-    assert first["actions"][0] == {"target": "P-C", "what": "P-C의 중국 희토류 수출 허가(선적마다), 교정 성적서 준비 상황을 "
+    assert first["actions"][0] == {"target": "P-C", "what": "P-C의 원산지 증명, 교정 성적서 준비 상황을 "
                                    "Equipment Vendor A에 확인", "by": "2027-03-26", "basis": "도착 예정일"}
-    assert [case["risk_id"] for case in first["cases"]] == ["RS-019"]
-    assert first["cases"][0]["temporal_status"] == "POST_AS_OF_REFERENCE"
+    # The workbook states neutral facts only; the rules never read a risk out of it.
+    procurement = call(client, "get", f"/api/projects/{project_id}")["version"]["data"]["procurement"]
+    assert not any("수출 허가" in str(item.get("permit_or_certification")) for item in procurement)
+    assert first["title"] == "중국산 통관 품목" and "linked_cause" not in first
+    assert briefing["as_of"] == "2025-08-20" and briefing["evidence_as_of"] == "2025-10-20"
     # No delay estimate anywhere, and missing attributes are named, not hidden.
     text = json.dumps(briefing, ensure_ascii=False)
     assert "delay_days" not in text and "일 지연" not in text and "일 늦" not in text
@@ -106,8 +109,11 @@ def test_briefing_agent_checks_at_most_three_times_and_the_calculator_keeps_the_
         tool("get_task_facts", reason="네 번째 확인", task_ids=["T042"]),
         tool("search_risk_cases", reason="수출 통제 사례를 봅니다.", query="export_control"),
         {"summary": "희토류 자석 품목이 가장 취약합니다.", "status": "completed", "briefing": {"risks": [
-            {"risk_key": "import_licence:CN", "decision": "keep", "reason": "P-C가 주공정", "added_item_ids": ["P-Z"],
-             "case_query": "export_control", "note": "P-C는 여유 0일이며 999일 늦으면 안 됩니다."},
+            {"risk_key": "import:CN", "decision": "keep", "reason": "P-C가 주공정", "added_item_ids": ["P-Z"],
+             "case_query": "export_control", "note": "P-C는 여유 0일이며 999일 늦으면 안 됩니다.",
+             "linked_cause": {"text": "희토류 자석 선적별 수출 통제", "case_ids": ["RS-019"]}},
+            {"risk_key": "permit", "decision": "keep", "reason": "인허가",
+             "linked_cause": {"text": "읽지 않은 사례로 붙인 원인", "case_ids": ["RS-017"]}},
             {"risk_key": "origin:KR", "decision": "exclude", "reason": "제작은 이미 발주된 설비라 원산지 위험이 작습니다."},
             {"risk_key": "customs:KR", "decision": "exclude", "reason": ""}]}},
         {"items": []},  # watch-plan enrichment
@@ -124,6 +130,11 @@ def test_briefing_agent_checks_at_most_three_times_and_the_calculator_keeps_the_
     # An item no tool returned is ignored; a number the calculator never produced is removed from the note.
     assert first["item_ids"] == ["P-A1", "P-B", "P-C"] and first["added_item_ids"] == []
     assert "999" not in first["agent_note"] and first["agent_note"].startswith("P-C는 여유 0일")
+    # A cause the workbook does not state stays only with an L2 case the agent read, judged at the evidence date.
+    assert first["linked_cause"]["text"] == "희토류 자석 선적별 수출 통제" and first["linked_cause"]["case_ids"] == ["RS-019"]
+    assert first["linked_cause"]["cases"][0]["temporal_status"] == "AVAILABLE_AS_OF"
+    assert [case["risk_id"] for case in first["cases"]] == ["RS-019"]
+    assert "linked_cause" not in next(risk for risk in risks if risk["cause"] == "permit")
     excluded = briefing["briefing"]["excluded"]
     assert [row["risk_key"] for row in excluded] == ["origin:KR"]  # no reason, no exclusion
     assert "R-customs-KR" in [risk["risk_id"] for risk in risks]
@@ -138,7 +149,7 @@ def test_triage_sorts_a_detected_notice_links_the_register_and_keeps_related_tas
             {"task_id": "T058", "relevance": "needs_check", "quote": NX2_QUOTE, "reason": "시뮬레이터 구동부 자석"},
             {"task_id": "T042", "relevance": "unrelated", "reason": "한국산 설비 통관"},
             {"task_id": "T999", "relevance": "related", "quote": NX2_QUOTE, "reason": "없는 작업"}],
-        "risk_links": [{"risk_id": "R-import-licence-CN", "quote": NX2_QUOTE}, {"risk_id": "R-nope", "quote": NX2_QUOTE}]}])
+        "risk_links": [{"risk_id": "R-import-CN", "quote": NX2_QUOTE}, {"risk_id": "R-nope", "quote": NX2_QUOTE}]}])
     event_id = call(client, "post", f"/api/projects/{project_id}/demo/external-signals/N-X2")["event_ids"][0]
     before = Store().get_json("events", event_id, project_id)["data"]
     drain()
@@ -151,11 +162,11 @@ def test_triage_sorts_a_detected_notice_links_the_register_and_keeps_related_tas
     # The triage never replaces the rule candidates a later supplier notice links by.
     assert event["related_task_ids"] == before["related_task_ids"] and event["candidates"] == before["candidates"]
     payload = json.loads(requests[0]["messages"][1]["content"])
-    assert payload["risk_register"][0]["risk_id"] == "R-import-licence-CN" and "status" not in payload["risk_register"][0]
+    assert payload["risk_register"][0]["risk_id"] == "R-import-CN" and "status" not in payload["risk_register"][0]
     assert any(item["item_id"] == "P-C" for item in payload["purchase_items"])
     risks = {row["risk_id"]: row for row in call(client, "get", f"/api/projects/{project_id}")["risks"]}
-    assert risks["R-import-licence-CN"]["status"] == "SIGNAL_DETECTED"
-    assert risks["R-import-licence-CN"]["links"][0]["actor"] == "triage"
+    assert risks["R-import-CN"]["status"] == "SIGNAL_DETECTED"
+    assert risks["R-import-CN"]["links"][0]["actor"] == "triage"
     with Store().connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM auto_usage_ledger").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0] == 0
@@ -197,7 +208,7 @@ def test_supplier_investigation_links_the_expected_risk_and_confirmation_moves_i
             {"kind": "hold_after_arrival", "item_id": "P-C", "value": 60, "fact_quote": quote}]),
         {"summary": "P-C가 늦으면 2028-02-11", "status": "needs_input", "stop_reason": "P-C 확인",
          "investigation": {"stop": "M4", "question": "P-C도 허가가 필요합니까?", "checks": [],
-                           "risk_link": {"risk_id": "R-import-licence-CN",
+                           "risk_link": {"risk_id": "R-import-CN",
                                          "reason": "등록 시 예상한 중국산 희토류 자석 품목 수출 허가 위험이 P-A1에서 발생했습니다."}},
          "email_draft": None},
         {"summary": "재계산", "status": "needs_review", "stop_reason": "", "option_explanations": []},
@@ -209,16 +220,16 @@ def test_supplier_investigation_links_the_expected_risk_and_confirmation_moves_i
     assert context["risk_register"][0]["item_ids"] == ["P-A1", "P-B", "P-C"]
     assert "export_control" in context["case_queries"]
     link = run["data"]["risk_link"]
-    assert link["risk_id"] == "R-import-licence-CN" and link["status"] == "OCCURRED"
+    assert link["risk_id"] == "R-import-CN" and link["status"] == "OCCURRED"
     assert link["expected_by"] == "briefing" and link["previous_status"] == "EXPECTED"
     assert any(warning.startswith("P-C:") for warning in link["critical_warnings"])
     resolved = call(client, "post", f"/api/projects/{project_id}/investigations/{run['id']}/resolve",
                     json={"decision": "applies", "note": "P-C도 대상"})
     assert resolved["analysis_run_id"]
     risk = next(row for row in call(client, "get", f"/api/projects/{project_id}")["risks"]
-                if row["risk_id"] == "R-import-licence-CN")
+                if row["risk_id"] == "R-import-CN")
     assert [row["status"] for row in risk["history"]] == ["EXPECTED", "OCCURRED", "RESPONDING"]
-    closed = call(client, "patch", f"/api/projects/{project_id}/risks/R-import-licence-CN",
+    closed = call(client, "patch", f"/api/projects/{project_id}/risks/R-import-CN",
                   json={"status": "CLOSED", "note": "대응안 확정"})["risk"]
     assert closed["status"] == "CLOSED" and closed["history"][-1]["actor"] == "person"
 
@@ -283,3 +294,19 @@ def test_needs_check_tasks_are_calculated_only_when_a_person_picks_them(client, 
     assert [row["task_id"] for row in context["needs_check_selected_by_person"]] == ["T012"]
     slack = {row["task_id"]: row for row in run["data"]["agent"]["tool_log"][0]["result"]["tasks"]}
     assert slack["T013"]["absorbs_bound"] is True and slack["T012"]["absorbs_bound"] is False
+
+
+def test_starting_the_watch_brings_the_demo_notice_in_once(client):
+    project_id = hero(client)
+    drain()
+    assert call(client, "get", f"/api/projects/{project_id}")["events"] == []  # nothing arrives with the baseline
+    started = call(client, "post", f"/api/projects/{project_id}/watch/start")
+    assert started["mode"] == "demo_simulation" and len(started["event_ids"]) == 1
+    event = Store().get_json("events", started["event_ids"][0], project_id)["data"]
+    assert event["demo_signal_id"] == "N-X2" and event["channel"] == "registered_public_source"
+    again = call(client, "post", f"/api/projects/{project_id}/watch/start")
+    assert again["event_ids"] == [] and again["watch_started_at"] == started["watch_started_at"]
+    assert call(client, "get", f"/api/projects/{project_id}")["project"]["watch_started_at"] == started["watch_started_at"]
+
+    other = call(client, "post", "/api/projects", json={"mode": "LIVE"})["project_id"]
+    assert client.post(f"/api/projects/{other}/watch/start", headers={"Authorization": "Bearer test-token"}).status_code == 409

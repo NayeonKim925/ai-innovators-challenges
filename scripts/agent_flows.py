@@ -143,8 +143,9 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
                     "label", "option_ids", "finish_date", "supplier_finish_shift_days",
                     "external_additional_shift_days", "recovery_days_vs_no_response")} for row in run["scenarios"]]}
 
-    def investigate(event_id: str) -> dict:
-        queued = call("POST", f"/api/projects/{project_id}/events/{event_id}/investigations")
+    def investigate(event_id: str, include: list[str] | None = None) -> dict:
+        queued = call("POST", f"/api/projects/{project_id}/events/{event_id}/investigations",
+                      {"include_task_ids": include} if include else None)
         drain()
         run = call("GET", f"/api/runs/{queued['run_id']}")["run"]
         return {"agent": run["data"].get("agent"), "status": run["data"].get("status"), "run_id": run["id"],
@@ -177,7 +178,8 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
         return runs
 
     if flow in {"X2", "X2-C", "X2-resolved"}:
-        notice_id = call("POST", f"/api/projects/{project_id}/demo/external-signals/N-X2")["event_ids"][0]
+        # As on screen: starting the watch simulates one collection, which brings in N-X2.
+        notice_id = call("POST", f"/api/projects/{project_id}/watch/start")["event_ids"][0]
         drain()
         runs["triage"] = triage(notice_id)
     if flow in {"H04", "H02", "V08", "X2", "X2-C", "X2-resolved"}:
@@ -218,7 +220,10 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
         event_id = call("POST", f"/api/projects/{project_id}/demo/external-signals/{flow}")["event_ids"][0]
         drain()
         runs["triage"] = triage(event_id)
-        runs["investigation"] = investigate(event_id)
+        # X1-B: when the triage leaves T013 for a person to check, the person picks it (as on screen).
+        picked = ["T013"] if flow == "X1-B" and "T013" in runs["triage"]["needs_check"] else None
+        runs["investigation"] = investigate(event_id, picked)
+        runs["investigation"]["picked_by_person"] = picked or []
         runs["investigation"]["risk_link"] = call("GET", f"/api/runs/{runs['investigation']['run_id']}")["run"]["data"].get("risk_link")
     else:
         plan = dict(project["watch_plan"])

@@ -27,23 +27,28 @@ EU = {"Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czechia", "Denmark
 COUNTRY_KO = {"China": "중국", "South Korea": "한국", "Germany": "독일", "Hungary": "헝가리", "Japan": "일본",
               "United States": "미국"}
 CODE = {"China": "CN", "South Korea": "KR", "Germany": "DE", "Hungary": "HU", "Japan": "JP", "United States": "US"}
-CAUSE_LABEL = {"import_licence": "역외 원산지 품목 통관·허가", "customs": "역외 원산지 설비 통관",
+CAUSE_LABEL = {"import": "역외 원산지 품목 통관", "customs": "역외 원산지 설비 통관",
                "permit": "인허가", "outdoor": "야외 작업", "origin": "역외 협력사 작업"}
 ATTRIBUTES = ("origin_country", "customs_required", "permit_required", "outdoor")
 
 BRIEFING_PROMPT = (
     "You review a newly registered baseline schedule's risk candidates before any change signal arrives. "
     "Deterministic rules grouped purchase items and tasks by cause (origin outside the EU, customs, permits, outdoor "
-    "work) and ranked the groups by schedule float; context.candidates lists them. Decide which candidates deserve a "
-    "closer look and use at most three checks in total: find_procurement_items to find other purchase items with the "
-    "same cause (same origin, supplier or customs need) that a group is missing, get_task_facts to see whether a task "
-    "really carries an attribute, check_schedule_slack for a task's float. Exclude a candidate only when a tool result "
-    "or the given facts show its cause does not apply, and say why. You may choose one L2 case query per risk from "
-    "context.case_queries by id, and call search_risk_cases once to read the cases of one query. "
+    "work) and ranked the groups by schedule float; context.briefing_candidates lists them. Decide which candidates "
+    "deserve a closer look and use at most three checks in total: find_procurement_items to find other purchase items "
+    "with the same cause (same origin, supplier or customs need) that a group is missing, get_task_facts to see whether "
+    "a task really carries an attribute, check_schedule_slack for a task's float. Exclude a candidate only when a tool "
+    "result or the given facts show its cause does not apply, and say why. The workbook states only neutral facts "
+    "(item names, origin, customs need, documents); it never states a risk. For each risk choose the L2 case query "
+    "from context.case_queries that fits those facts best, and call search_risk_cases once to read the cases of the "
+    "query that matters most. When the item facts together with a case you read point to a specific cause the "
+    "workbook does not state (for example an export control on a material the items contain), name it in "
+    "linked_cause with the ids of the cases you read; never name a cause without such a case. "
     "Every tool call must include reason: one Korean sentence saying why this check is needed. "
     "Never state delay days or invent items, tasks, dates or numbers; floats and the ranking come from the calculator. "
     'Return only JSON: {"summary": one Korean sentence, "status": "completed", "briefing": {"risks": [{"risk_key", '
     '"decision": "keep|exclude", "reason": Korean string, "added_item_ids": [], "case_query": id or "", '
+    '"linked_cause": {"text": short Korean phrase, "case_ids": []} or null, '
     '"note": one Korean line for the project team}]}}. Never request commit or send actions.'
 )
 
@@ -111,21 +116,23 @@ def _groups(tasks: list[dict[str, Any]], procurement: list[dict[str, Any]]) -> l
     groups: list[dict[str, Any]] = []
     covered: set[str] = set()
 
-    imports: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    # Import items are grouped by the workbook's neutral facts only (origin outside the EU, customs needed).
+    # A specific cause such as an export control is the agent's to name, from an L2 case it read.
+    imports: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in procurement:
         origin = _country(item.get("origin_country"))
         if item.get("customs_required") and _outside_eu(origin) and str(item.get("needed_for_task_id")) in open_tasks:
-            imports[(origin, _requirement(item))].append(item)
-    for (origin, requirement), items in sorted(imports.items()):
-        suffix = f" · {requirement}" if requirement else ""
-        query = "export_control" if "수출" in requirement or "export" in requirement.lower() else "logistics"
+            imports[origin].append(item)
+    for origin, items in sorted(imports.items()):
+        documents = any(_requirement(item) for item in items)
         ids = sorted({str(item["needed_for_task_id"]) for item in items})
         covered.update(ids)
-        groups.append({"risk_key": f"import_licence:{CODE.get(origin, origin)}", "cause": "import_licence",
-                       "attributes": ["원산지 역외", "통관 필요"] + (["허가·인증 요건"] if requirement else []),
-                       "title": f"{_ko(origin)}산 품목 통관{suffix}", "item_ids": [item["item_id"] for item in items],
-                       "task_ids": ids, "case_query": query,
-                       "basis": f"구매 목록: 원산지 {origin}, 통관 필요, 허가·인증 '{requirement or NO_ATTRIBUTE}'"})
+        groups.append({"risk_key": f"import:{CODE.get(origin, origin)}", "cause": "import",
+                       "attributes": ["원산지 역외", "통관 필요"] + (["허가·인증 서류"] if documents else []),
+                       "title": f"{_ko(origin)}산 통관 품목", "item_ids": [item["item_id"] for item in items],
+                       "task_ids": ids, "case_query": "logistics",
+                       "basis": f"구매 목록: 원산지 {origin}, 통관 필요"
+                                + (", 허가·인증 서류 있음" if documents else "")})
 
     def add(cause: str, key: str, title: str, ids: list[str], query: str, basis: str, attributes: list[str]) -> None:
         ids = sorted(set(ids) - covered) if cause in {"customs", "origin"} else sorted(set(ids))
@@ -201,7 +208,8 @@ def _action_at(cause: str, row: dict[str, Any]) -> dict[str, Any]:
 
 
 def assemble(group: dict[str, Any], project: dict[str, Any], tasks: list[dict[str, Any]],
-             procurement: list[dict[str, Any]], floats: dict[str, int], as_of: str) -> dict[str, Any]:
+             procurement: list[dict[str, Any]], floats: dict[str, int], as_of: str,
+             evidence_as_of: str = "") -> dict[str, Any]:
     by_id = {str(task["task_id"]): task for task in tasks}
     items = {str(item["item_id"]): item for item in procurement}
     item_rows = [_item_row(items[item_id], by_id, floats) for item_id in group["item_ids"] if item_id in items]
@@ -218,7 +226,7 @@ def assemble(group: dict[str, Any], project: dict[str, Any], tasks: list[dict[st
     warnings = [f"{row.get('item_id') or row['task_id']}: 여유 0일이라 취약합니다(주공정). "
                 f"{row.get('task_id')} 착수가 늦어지면 프로젝트 완료일이 바로 밀립니다."
                 for row in ordered if row["float_days"] == 0]
-    cases = search_cases(group["case_query"], as_of, limit=3)
+    cases = search_cases(group["case_query"], evidence_as_of or as_of, limit=3)
     risk = {**{key: group[key] for key in ("risk_key", "cause", "title", "basis", "case_query", "attributes")},
             "cause_label": CAUSE_LABEL.get(group["cause"], group["cause"]),
             "item_ids": [row["item_id"] for row in item_rows], "task_ids": sorted({row["task_id"] for row in rows}),
@@ -257,10 +265,13 @@ def coverage(tasks: list[dict[str, Any]]) -> dict[str, Any]:
 
 def rule_briefing(project: dict[str, Any], tasks: list[dict[str, Any]], procurement: list[dict[str, Any]]) -> dict[str, Any]:
     as_of = str(project.get("status_as_of") or "")[:10]
+    # Evidence is judged as of the briefing's own date; the schedule's status date stays as it is.
+    evidence_as_of = str(project.get("evidence_as_of") or as_of)[:10]
     groups = _groups(tasks, procurement)
     floats = task_floats(project, tasks, [task_id for group in groups for task_id in group["task_ids"]])
-    ranked = _rank([assemble(group, project, tasks, procurement, floats, as_of) for group in groups])
-    return {"as_of": as_of, "candidates": ranked, "coverage": coverage(tasks), "floats": floats}
+    ranked = _rank([assemble(group, project, tasks, procurement, floats, as_of, evidence_as_of) for group in groups])
+    return {"as_of": as_of, "evidence_as_of": evidence_as_of, "candidates": ranked, "coverage": coverage(tasks),
+            "floats": floats}
 
 
 def _model_candidate(risk: dict[str, Any]) -> dict[str, Any]:
@@ -303,7 +314,7 @@ def agent_review(project: dict[str, Any], tasks: list[dict[str, Any]], procureme
         state["searches"] += 1
         if state["searches"] > 1:
             return {"status": "limit_reached"}
-        return search_cases(query, rules["as_of"])
+        return search_cases(query, rules["evidence_as_of"])
 
     search_risk_cases.parameters_schema = {  # type: ignore[attr-defined]
         "type": "object", "required": ["reason", "query"], "additionalProperties": False,
@@ -312,7 +323,8 @@ def agent_review(project: dict[str, Any], tasks: list[dict[str, Any]], procureme
              "check_schedule_slack": check_schedule_slack, "search_risk_cases": search_risk_cases}
     context = {
         "_llm_gateway": gateway,
-        "project": {key: project.get(key) for key in ("country", "target_finish", "status_as_of") if project.get(key)},
+        "project": {key: project.get(key) for key in ("country", "target_finish", "status_as_of", "evidence_as_of")
+                    if project.get(key)},
         "briefing_candidates": [_model_candidate(risk) for risk in rules["candidates"][:AGENT_CANDIDATES]],
         "attribute_coverage": rules["coverage"],
         "case_queries": {key: value["label"] for key, value in CASE_QUERIES.items()},
@@ -328,10 +340,13 @@ def finalize(project: dict[str, Any], tasks: list[dict[str, Any]], procurement: 
     reviewed = {row["risk_key"] for row in candidates[:AGENT_CANDIDATES]}
     decisions: dict[str, dict[str, Any]] = {}
     found: set[str] = set()
+    read_cases: dict[str, dict[str, Any]] = {}
     if agent:
         for entry in agent.get("tool_log") or []:
             if entry.get("tool") == "find_procurement_items" and entry.get("status") == "ok":
                 found.update(str(row.get("item_id")) for row in (entry.get("result") or {}).get("items") or [])
+            if entry.get("tool") == "search_risk_cases" and entry.get("status") == "ok":
+                read_cases.update({str(row.get("risk_id")): row for row in (entry.get("result") or {}).get("results") or []})
         for row in ((agent.get("briefing") or {}).get("risks") or []):
             if isinstance(row, dict) and row.get("risk_key") in reviewed:
                 decisions[str(row["risk_key"])] = row
@@ -356,8 +371,16 @@ def finalize(project: dict[str, Any], tasks: list[dict[str, Any]], procurement: 
             if missing:
                 floats.update(task_floats(project, tasks, missing))
             group["task_ids"] = sorted(set(group["task_ids"]) | set(new_tasks))
-            risk = {**assemble(group, project, tasks, procurement, floats, rules["as_of"]), "added_item_ids": added}
+            risk = {**assemble(group, project, tasks, procurement, floats, rules["as_of"], rules["evidence_as_of"]),
+                    "added_item_ids": added}
             assigned.update(added)
+        linked = decision.get("linked_cause") if isinstance(decision.get("linked_cause"), dict) else {}
+        case_ids = [str(case_id) for case_id in linked.get("case_ids") or [] if str(case_id) in read_cases]
+        if str(linked.get("text") or "").strip() and case_ids:
+            risk = {**risk, "linked_cause": {
+                "text": str(linked["text"]).strip()[:120], "case_ids": case_ids,
+                "cases": [{key: read_cases[case_id].get(key) for key in ("risk_id", "title", "published_date", "source_url",
+                                                                          "temporal_status")} for case_id in case_ids]}}
         note = str(decision.get("note") or "").strip()
         if note:
             risk["agent_note"] = note[:200]
@@ -369,5 +392,5 @@ def finalize(project: dict[str, Any], tasks: list[dict[str, Any]], procurement: 
     for rank, risk in enumerate(top, start=1):
         risk["rank"] = rank
         risk["risk_id"] = "R-" + risk["risk_key"].replace(":", "-").replace("_", "-")
-    return {"as_of": rules["as_of"], "risks": top, "excluded": excluded, "coverage": rules["coverage"],
+    return {"as_of": rules["as_of"], "evidence_as_of": rules["evidence_as_of"], "risks": top, "excluded": excluded, "coverage": rules["coverage"],
             "more_count": max(0, len(ranked) - len(top))}

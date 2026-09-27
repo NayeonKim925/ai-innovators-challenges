@@ -634,7 +634,8 @@ def _link_investigation(db: Store, run: dict[str, Any], event: dict[str, Any], p
                 str(proposed.get("reason") or "")[:300] or f"{source}가 같은 원인입니다.",
                 event_id=run["event_id"], run_id=run["id"])
     expected = next((row for row in before.get("history") or [] if row.get("status") == "EXPECTED"), {})
-    return {"risk_id": risk["risk_id"], "title": risk["title"], "reason": proposed.get("reason"),
+    return {"risk_id": risk["risk_id"], "title": risk["title"], "linked_cause": risk.get("linked_cause"),
+            "reason": proposed.get("reason"),
             "status": risk["status"], "status_label": STATUS_LABEL[risk["status"]],
             "previous_status": before.get("status"), "expected_at": expected.get("at"),
             "expected_by": expected.get("actor"), "item_ids": risk.get("item_ids"),
