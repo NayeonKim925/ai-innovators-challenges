@@ -2839,4 +2839,7 @@ details.agent-decision > summary { cursor: pointer; }
   .briefing-head .status-chip { grid-column: 2; justify-self: start; }
   .risk-table { display: block; overflow-x: auto; }
 }
-.triage li.pickable label { display: inline-flex; gap: 6px; align-items: center; font-weight: 400; }
+.triage li.pickable { list-style: none; margin-left: -18px; }
+.triage li.pickable label { display: flex; flex-direction: row; gap: 6px; align-items: baseline; margin: 0; font-weight: 400; color: inherit; }
+.triage li.pickable input[type="checkbox"] { width: 14px; height: 14px; min-height: 0; margin: 0; padding: 0; flex: none; }
+.triage-buckets > div > small { display: block; margin: 2px 0 4px; }
