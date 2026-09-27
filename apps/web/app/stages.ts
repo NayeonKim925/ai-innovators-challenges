@@ -7,6 +7,7 @@ type Row = Dict & { id?: string; data?: Dict; status?: string; kind?: string; ev
 export const SECTIONS = [
   { id: "overview", label: "개요" },
   { id: "schedule", label: "일정" },
+  { id: "watch", label: "감시" },
   { id: "changes", label: "변경" },
   { id: "scenarios", label: "대응안" },
   { id: "execute", label: "실행" },
@@ -18,6 +19,7 @@ export type SectionId = (typeof SECTIONS)[number]["id"];
 export const STAGES = [
   { code: "BRIEF", label: "프로젝트 맥락", section: "overview" },
   { code: "IMPORT", label: "기준 일정", section: "schedule" },
+  { code: "WATCH", label: "위험 브리핑·감시", section: "watch" },
   { code: "DETECT", label: "변경 감지", section: "changes" },
   { code: "COMPARE", label: "대응안 비교", section: "scenarios" },
   { code: "APPROVE", label: "조건 승인", section: "scenarios" },
@@ -35,6 +37,7 @@ export function sectionFromHash(hash: string): SectionId {
 
 export type ProjectRecords = {
   project?: Dict;
+  watch_plan?: Dict | null;
   version?: Row | null;
   events?: Row[];
   runs?: Row[];
@@ -59,6 +62,16 @@ export type Progress = {
 };
 
 const INACTIVE = new Set(["SUPERSEDED", "REJECTED"]);
+// Signals the watch collects: they live on the watch screen, not in the change flow, until a person analyses one.
+export const FEED_CHANNELS = new Set(["registered_public_source", "public_holiday", "weather_forecast"]);
+
+export function isFeedSignal(row?: Row) {
+  return FEED_CHANNELS.has(String(row?.data?.channel || ""));
+}
+
+export function watchStarted(state: ProjectRecords) {
+  return Boolean(state.project?.watch_started_at || state.watch_plan?.enabled);
+}
 const FINAL = new Set(["succeeded", "failed"]);
 
 export function hasPatch(data?: Dict) {
@@ -90,7 +103,7 @@ export function deriveProgress(state: ProjectRecords, preferEventId = ""): Progr
     && !(item.data as Dict | undefined)?.auto_detected)
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   const actedEvent = userRuns.length ? events.find((item) => item.id === userRuns[0].event_id) : undefined;
-  const newestEvent = events[0];
+  const newestEvent = events.find((item) => !isFeedSignal(item));
   const preferred = preferEventId ? events.find((item) => item.id === preferEventId) : undefined;
   const focusEvent = preferred || (actedEvent && (!newestEvent || String(userRuns[0].created_at || "") >= String(newestEvent.created_at || ""))
     ? actedEvent : newestEvent);
@@ -108,6 +121,8 @@ export function deriveProgress(state: ProjectRecords, preferEventId = ""): Progr
   const raw = [
     Boolean(state.project),
     Boolean(state.version),
+    // Starting the watch is the step; a change brought in without it still lets the steps after count.
+    watchStarted(state) || Boolean(focusEvent),
     Boolean(focusEvent && focusData.review_status === "CONFIRMED" && hasPatch(focusData)),
     Boolean(analysisRun),
     Boolean(approval),
@@ -122,17 +137,19 @@ export function deriveProgress(state: ProjectRecords, preferEventId = ""): Progr
   if (current <= 1) {
     next = { label: "기준 일정 연결", section: "schedule", detail: "hero 데모 일정 또는 Excel로 기준 일정을 연결하세요." };
   } else if (current === 2) {
-    if (!focusEvent) next = { label: "변경 불러오기", section: "changes", detail: "합성 통보를 불러오거나 협력사 메시지를 붙여 넣으세요." };
+    next = { label: "감시 시작", section: "watch", detail: "등록 시 위험 브리핑을 확인하고 감시를 시작하세요. 데모는 수집을 시뮬레이션합니다." };
+  } else if (current === 3) {
+    if (!focusEvent) next = { label: "변경 불러오기", section: "changes", detail: "받은편지함에서 협력사 통보를 불러오거나 메시지를 붙여 넣으세요." };
     else if (interpreting) next = { label: "변경 해석 확인", section: "changes", detail: "통보를 해석하고 있습니다. 끝나면 작업·날짜를 확인하세요." };
     else if (!hasPatch(focusData) && !focusData.evidence) next = { label: "작업·날짜 지정", section: "changes", detail: "통보에서 영향 작업을 찾지 못했습니다. 작업과 날짜를 지정하세요." };
     else next = { label: "변경 해석 확인", section: "changes", detail: "추출된 작업과 날짜가 맞는지 확인하면 영향 분석이 시작됩니다." };
-  } else if (current === 3) {
+  } else if (current === 4) {
     next = pendingAnalysis
       ? { label: "분석 결과 보기", section: "scenarios", detail: "영향을 계산하고 있습니다. 끝나면 대응안이 표시됩니다." }
       : { label: "영향 분석 시작", section: "changes", detail: "확인한 변경으로 영향 분석을 시작하세요." };
-  } else if (current === 4) {
-    next = { label: "대응안 비교·승인", section: "scenarios", detail: "대응안을 고르고 조건을 확인한 뒤 승인하세요." };
   } else if (current === 5) {
+    next = { label: "대응안 비교·승인", section: "scenarios", detail: "대응안을 고르고 조건을 확인한 뒤 승인하세요." };
+  } else if (current === 6) {
     next = { label: "새 일정 버전 확정", section: "execute", detail: "승인한 대응안을 새 일정 버전으로 확정하세요." };
   } else {
     next = { label: "Excel 다운로드", section: "execute", detail: "확정한 일정 버전을 Excel로 내려받거나 새 변경을 불러오세요." };
@@ -141,7 +158,7 @@ export function deriveProgress(state: ProjectRecords, preferEventId = ""): Progr
 }
 
 export function stageSummary(progress: Progress) {
-  if (progress.allDone) return "6단계 완료 · 새 일정 버전 확정됨";
+  if (progress.allDone) return `${STAGES.length}단계 완료 · 새 일정 버전 확정됨`;
   const stage = STAGES[progress.current];
   return `${progress.current + 1}단계 · ${stage.label}`;
 }

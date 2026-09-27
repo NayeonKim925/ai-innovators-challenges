@@ -40,7 +40,7 @@ function CaseList({ cases, label }: { cases: Dict[]; label?: unknown }) {
   if (!cases.length) return <small className="muted">저장된 L2 사례 없음</small>;
   return <p className="risk-cases"><small>L2 실제 사례{label ? ` · ${text(label)}` : ""}:</small>{cases.map((row, index) => <span key={text(row.risk_id)}>
     {index ? " · " : " "}<a href={text(row.source_url)} target="_blank" rel="noreferrer">{text(row.risk_id)} {text(row.title)}</a>
-    <small> ({text(row.published_date)}{row.temporal_status === "POST_AS_OF_REFERENCE" ? " · 기준 시점 이후 발행: 참고만" : ""})</small>
+    <small> ({text(row.published_date)}{row.temporal_status === "POST_AS_OF_REFERENCE" ? " · 근거 기준일 이후 발행: 참고만" : ""})</small>
   </span>)}</p>;
 }
 
@@ -63,7 +63,7 @@ export function BriefingPanel({ briefing, llmMode }: { briefing?: Dict | null; l
   const agentReviewed = agent.mode === "agent_review";
   return <section className="focus-card briefing" aria-label="등록 시 위험 브리핑">
     <div className="panel-heading"><div>
-      <span className="eyebrow">사전 에이전트 · 등록 시 브리핑 · 기준 시점 {text(result.as_of)}</span>
+      <span className="eyebrow">사전 에이전트 · 등록 시 브리핑 · 일정 기준 {text(result.as_of)} · 근거 기준 {text(result.evidence_as_of || result.as_of)}</span>
       <h3>이 일정에서 먼저 볼 위험 {risks.length}개</h3>
       <p>순위와 여유 일수는 계산기 결과입니다. 지연 일수를 예측하지 않고, 여유가 얼마나 남았는지로 취약도를 표시합니다.</p>
     </div><span className={`status-chip${agentReviewed ? " confirm" : ""}`}>{agentReviewed ? "규칙 + 에이전트 확인" : "규칙·계산기만"}</span></div>
@@ -79,6 +79,7 @@ export function BriefingPanel({ briefing, llmMode }: { briefing?: Dict | null; l
           <div><b>{text(risk.title)}</b><small>{text(score.label)} · 근거: {text(risk.basis)}</small></div>
           <span className={`status-chip ${LEVEL_CLASS[text(vulnerability.level, "")] || ""}`}>{text(vulnerability.label)}</span>
         </div>
+        <LinkedCause cause={risk.linked_cause as Dict | undefined} />
         {list(risk.critical_warnings).map((warning, index) => <p key={index} className="critical-warning">{text(warning)}</p>)}
         {items.length > 0 && <table className="risk-table"><thead><tr><th>품목</th><th>협력사</th><th>원산지</th><th>통관</th><th>허가·인증</th><th>도착 예정</th><th>필요 작업</th><th>여유</th></tr></thead>
           <tbody>{items.map((row) => <tr key={text(row.item_id)} className={row.float_days === 0 ? "critical" : ""}>
@@ -113,6 +114,14 @@ export function BriefingPanel({ briefing, llmMode }: { briefing?: Dict | null; l
   </section>;
 }
 
+/** A cause the workbook does not state, named by the agent only with an L2 case it read. */
+function LinkedCause({ cause }: { cause?: Dict }) {
+  if (!cause) return null;
+  return <p className="linked-cause">에이전트가 L2 근거로 연결한 원인: <b>{text(cause.text)}</b>{list(cause.cases).map((row) => <span key={text(row.risk_id)}>
+    {" · "}<a href={text(row.source_url)} target="_blank" rel="noreferrer">{text(row.risk_id)} {text(row.title)}</a> <small>({text(row.published_date)}{row.temporal_status === "POST_AS_OF_REFERENCE" ? " · 근거 기준일 이후: 참고만" : ""})</small></span>)}
+    <small> · 엑셀에는 위험이 적혀 있지 않고, 품목 사실(원산지·통관·품목명)과 실제 사례를 에이전트가 연결했습니다.</small></p>;
+}
+
 function briefingCheck(entry: Dict) {
   const result = (entry.result || {}) as Dict;
   if (result.status === "limit_reached") return "확인 한도(3회)를 넘어 실행하지 않음";
@@ -137,6 +146,7 @@ export function RiskRegister({ risks, busy, onStatus }: { risks: Dict[]; busy: b
       const current = STATUS_ORDER.indexOf(text(risk.status));
       return <li key={riskId} className={`register-row status-${text(risk.status).toLowerCase()}`}>
         <div className="register-head"><b>{riskId}</b> <span>{text(risk.title)}</span></div>
+        {risk.linked_cause ? <small className="linked-cause-line">에이전트가 L2 근거로 연결한 원인: {text((risk.linked_cause as Dict).text)} ({((risk.linked_cause as Dict).case_ids as string[] || []).join(", ")})</small> : null}
         <ol className="status-track" aria-label={`${riskId} 상태`}>{STATUS_ORDER.map((name, index) => <li key={name} className={index < current ? "past" : index === current ? "now" : ""}>{RISK_STATUS[name]}</li>)}</ol>
         <small>관련 {list(risk.items).length ? `품목 ${((risk.item_ids || []) as string[]).join("·")} · ` : ""}작업 {((risk.task_ids || []) as string[]).slice(0, 6).join("·")}{((risk.task_ids || []) as string[]).length > 6 ? " 외" : ""}</small>
         <details><summary>근거와 변경 이력 {list(risk.history).length}건</summary>
@@ -205,7 +215,7 @@ export function RiskLinkNote({ link, compact = false }: { link?: Dict | null; co
   if (compact) return <p className="risk-link-line">리스크 대장: {occurred ? "등록 시 예상했던 위험이 발생함" : "등록 시 예상했던 위험의 신호"} · {text(link.risk_id)} {text(link.title)}</p>;
   return <div className="risk-link" aria-label="등록 시 예상했던 위험">
     <span className="eyebrow">리스크 대장 연결 · {RISK_STATUS[text(link.previous_status)] || text(link.previous_status)} → {text(link.status_label)}</span>
-    <b>{occurred ? "등록 시 예상했던 위험이 발생함" : "등록 시 예상했던 위험의 신호"}: {text(link.risk_id)} {text(link.title)}</b>
+    <b>{occurred ? "등록 시 예상했던 위험이 발생함" : "등록 시 예상했던 위험의 신호"}: {text(link.risk_id)} {text(link.title)}{link.linked_cause ? ` · ${text((link.linked_cause as Dict).text)}` : ""}</b>
     {link.reason ? <p>{text(link.reason)}</p> : null}
     {warnings.map((warning, index) => <p key={index} className="critical-warning">등록 시 경고: {text(warning)}</p>)}
     <small>{link.expected_by === "briefing" ? `기준 일정 등록 때 브리핑이 예상함 (${text(link.expected_at).replace("T", " ").slice(0, 16)})` : ""}</small>
