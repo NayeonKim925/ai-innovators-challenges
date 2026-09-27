@@ -88,12 +88,11 @@ export function Inbox({ messages, selectedId, importedIds, busy, hint, onSelect,
           className={`inbox-row${row.id === selectedId ? " selected" : ""}${imported ? " imported" : ""}`}
           onClick={() => onSelect(row.id)} onKeyDown={(event) => { if (event.key === "Enter") onSelect(row.id); }} tabIndex={0}>
           <span className="inbox-from">{row.from}</span>
-          <span className="inbox-subject">
-            {row.tag === "lead" && <em className="inbox-tag lead">대표 데모</em>}
-            {imported && <em className="inbox-tag">등록됨</em>}
-            <b>{row.subject}</b> <small>{row.preview}</small>
-          </span>
           <time className="inbox-time">{received(row.receivedAt)}</time>
+          <span className="inbox-subject">
+            {(row.tag === "lead" || imported) && <span>{row.tag === "lead" && <em className="inbox-tag lead">대표 데모</em>}{imported && <em className="inbox-tag">등록됨</em>}</span>}
+            <b>{row.subject}</b><small>{row.preview}</small>
+          </span>
         </li>;
       })}
     </ul>

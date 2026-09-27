@@ -216,8 +216,9 @@ def assemble(group: dict[str, Any], project: dict[str, Any], tasks: list[dict[st
     for row in item_rows:
         row["needed_by"] = str((by_id.get(row["task_id"]) or {}).get("baseline_start") or "")[:10]
     item_tasks = {row["task_id"] for row in item_rows}
-    task_rows = [_task_row(by_id[task_id], floats) for task_id in group["task_ids"]
-                 if task_id in by_id and (task_id not in item_tasks or group["cause"] != "import_licence")]
+    # The agent reads every task of the group with its attributes; the screen lists an item's task once, under it.
+    context_rows = [_task_row(by_id[task_id], floats) for task_id in group["task_ids"] if task_id in by_id]
+    task_rows = [row for row in context_rows if not (group["cause"] == "import" and row["task_id"] in item_tasks)]
     rows = item_rows + task_rows
     days = [row["float_days"] for row in rows if row["float_days"] is not None]
     lowest = min(days) if days else None
@@ -230,7 +231,7 @@ def assemble(group: dict[str, Any], project: dict[str, Any], tasks: list[dict[st
     risk = {**{key: group[key] for key in ("risk_key", "cause", "title", "basis", "case_query", "attributes")},
             "cause_label": CAUSE_LABEL.get(group["cause"], group["cause"]),
             "item_ids": [row["item_id"] for row in item_rows], "task_ids": sorted({row["task_id"] for row in rows}),
-            "items": item_rows, "tasks": task_rows[:8], "task_count": len(task_rows),
+            "items": item_rows, "tasks": task_rows[:8], "context_tasks": context_rows[:8], "task_count": len(task_rows),
             "min_float_days": lowest, "vulnerability": vulnerability(lowest), "critical_warnings": warnings,
             "actions": [_action(group["cause"], row, as_of) for row in ordered[:3]],
             "cases": [{key: row.get(key) for key in ("risk_id", "title", "published_date", "source_url",
@@ -281,7 +282,7 @@ def _model_candidate(risk: dict[str, Any]) -> dict[str, Any]:
                                                       "customs_required", "requirement", "planned_arrival", "task_id",
                                                       "float_days")} for row in risk["items"]],
             "tasks": [{key: row.get(key) for key in ("task_id", "name", "supplier_id", *ATTRIBUTES, "baseline_start",
-                                                      "float_days")} for row in risk["tasks"]]}
+                                                      "float_days")} for row in risk["context_tasks"]]}
 
 
 def agent_review(project: dict[str, Any], tasks: list[dict[str, Any]], procurement: list[dict[str, Any]],

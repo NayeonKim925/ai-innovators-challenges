@@ -2847,14 +2847,16 @@ details.agent-decision > summary { cursor: pointer; }
 /* Inbox-shaped list of incoming supplier notices */
 .inbox { display: grid; gap: 10px; margin-bottom: 12px; }
 .inbox-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; background: #fff; max-height: 360px; overflow-y: auto; }
-.inbox-row { display: grid; grid-template-columns: 150px 1fr auto; gap: 10px; align-items: baseline; padding: 9px 12px; border-bottom: 1px solid #eef0ec; cursor: pointer; font-size: 13px; }
+.inbox-row { display: grid; grid-template-columns: 1fr auto; column-gap: 10px; row-gap: 2px; align-items: baseline; padding: 9px 12px; border-bottom: 1px solid #eef0ec; cursor: pointer; font-size: 13px; }
 .inbox-row:last-child { border-bottom: 0; }
 .inbox-row:hover { background: #f6f8fb; }
 .inbox-row.selected { background: var(--accent-soft); }
 .inbox-row.imported { color: var(--muted); }
 .inbox-from { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.inbox-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.inbox-subject small { color: var(--muted); }
+.inbox-subject { grid-column: 1 / -1; display: grid; min-width: 0; }
+.inbox-subject b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-subject small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-subject .inbox-tag { justify-self: start; margin-bottom: 2px; }
 .inbox-time { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .inbox-tag { font-style: normal; font-size: 10px; font-weight: 800; border-radius: 999px; padding: 2px 7px; margin-right: 6px; background: #eef1f0; color: #52606a; }
 .inbox-tag.lead { background: var(--deep); color: #fff; }
@@ -2870,10 +2872,7 @@ details.agent-decision > summary { cursor: pointer; }
 .feed-merged .status-chip { justify-self: start; }
 .feed-merged small { color: var(--muted); }
 .feed-merged .text-button { justify-self: start; }
-@media (max-width: 760px) {
-  .inbox-row { grid-template-columns: 1fr auto; }
-  .inbox-subject { grid-column: 1 / -1; white-space: normal; }
-}
+
 .linked-cause { margin: 8px 0 0; padding: 7px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 6px; font-size: 13px; }
 .linked-cause small { color: var(--muted); }
 .linked-cause-line { display: block; color: #2f4fb8; font-size: 12px; margin-top: 2px; }
