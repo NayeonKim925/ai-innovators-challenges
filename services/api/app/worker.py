@@ -53,14 +53,24 @@ def _scenario_record(run: dict[str, Any], event: dict[str, Any], version: dict[s
     }
 
 
-def _record_usage(db: Store, run_id: str, output: dict[str, Any]) -> None:
+LEDGERS = {"usage_ledger", "auto_usage_ledger"}
+# Sorting every rule candidate with a reason takes a reasoning model longer than one ordinary call.
+SORT_TIMEOUT = 150.0
+# The investigation's final answer (judgment, question, email draft) can outlast the default 30 s. Which call
+# returns it is only known after it returns, so every call in the investigation loop may wait this long.
+FINAL_ANSWER_TIMEOUT = 90.0
+
+
+def _record_usage(db: Store, run_id: str, output: dict[str, Any], ledger: str = "usage_ledger") -> None:
+    if ledger not in LEDGERS:
+        raise ValueError("unknown ledger")
     usage = output.get("usage") or {}
     with db.transaction() as conn:
-        previous = conn.execute("SELECT input_tokens, output_tokens FROM usage_ledger WHERE run_id=?", (run_id,)).fetchone()
+        previous = conn.execute(f"SELECT input_tokens, output_tokens FROM {ledger} WHERE run_id=?", (run_id,)).fetchone()
         prompt = usage.get("prompt_tokens")
         completion = usage.get("completion_tokens")
         conn.execute(
-            "UPDATE usage_ledger SET model=?, input_tokens=?, output_tokens=? WHERE run_id=?",
+            f"UPDATE {ledger} SET model=?, input_tokens=?, output_tokens=? WHERE run_id=?",
             (
                 output.get("model") or usage.get("model") or os.environ.get("LLM_MODEL"),
                 ((previous["input_tokens"] or 0) + prompt) if prompt is not None and previous else
@@ -105,21 +115,32 @@ def _candidate_options(options: list[dict[str, Any]], unavailable: set[str]) -> 
     return candidates[:8]
 
 
-def _reserve_paid_attempt(db: Store, run_id: str) -> str:
-    """Reserve before network I/O so crash recovery cannot silently double-charge."""
+def auto_triage_limit() -> int:
+    return max(0, int(os.environ.get("REPLAN_MAX_AUTO_TRIAGE_PER_DAY", "20")))
+
+
+def _reserve_paid_attempt(db: Store, run_id: str, ledger: str = "usage_ledger") -> str:
+    """Reserve before network I/O so crash recovery cannot silently double-charge.
+
+    Automatic triage of detected changes counts against its own daily limit, so it never uses up
+    the analyses and investigations a person starts.
+    """
+    if ledger not in LEDGERS:
+        raise ValueError("unknown ledger")
     if llm_mode() == "replay":
         return "reserved"  # recorded responses cost nothing and are not counted
-    limit = max(0, int(os.environ.get("REPLAN_MAX_PAID_RUNS_PER_DAY", "20")))
+    limit = (auto_triage_limit() if ledger == "auto_usage_ledger"
+             else max(0, int(os.environ.get("REPLAN_MAX_PAID_RUNS_PER_DAY", "20"))))
     today = utcnow()[:10]
     with db.transaction() as conn:
-        existing = conn.execute("SELECT id FROM usage_ledger WHERE run_id=?", (run_id,)).fetchone()
+        existing = conn.execute(f"SELECT id FROM {ledger} WHERE run_id=?", (run_id,)).fetchone()
         if existing:
             return "already_attempted"
-        count = conn.execute("SELECT COUNT(*) FROM usage_ledger WHERE created_at LIKE ?", (today + "%",)).fetchone()[0]
+        count = conn.execute(f"SELECT COUNT(*) FROM {ledger} WHERE created_at LIKE ?", (today + "%",)).fetchone()[0]
         if count >= limit:
             return "budget_stopped"
         conn.execute(
-            "INSERT INTO usage_ledger VALUES (?,?,?,?,?,?,?,?)",
+            f"INSERT INTO {ledger} VALUES (?,?,?,?,?,?,?,?)",
             (identifier(), run_id, os.environ.get("LLM_MODEL"), None, None, None, "UNKNOWN", utcnow()),
         )
     return "reserved"
@@ -290,26 +311,38 @@ def _run_review_agent(db: Store, run: dict[str, Any], project: dict[str, Any], t
 
 INVESTIGATION_PROMPT = (
     "You investigate whether an external change affects a project schedule. Deterministic tools do all date, "
-    "float and schedule work; you decide what to check next and stop as early as the evidence allows. "
+    "float and schedule work. There is no fixed order of steps: decide which checks the evidence still needs, call "
+    "only those (independent checks may go in the same turn) and stop as soon as the evidence allows. "
     "Every tool call must include reason: one Korean sentence saying why this check is needed now. "
-    "When context.supplier_notice is present: first decide from the supplier's stated reason and each "
-    "context.related_signals quote whether they share a cause. If not, stop with M1. If they do, look for other "
-    "purchase items the notice's condition also covers (same supplier and origin, customs, arriving later) with "
-    "find_procurement_items; the supplier did not mention them. Take supplier_id and origin_country from "
-    "context.mentioned_items (the named item's supplier, not the owner of a logistics task) and arriving_after from "
-    "that item's planned_arrival. Then check_schedule_slack for the tasks those items "
-    "are needed for, using the notice's duration bound; then simulate_conditional (kind hold_after_arrival, the "
-    "bound as value, the fact quote) only for items whose task cannot absorb the bound. "
-    "When context.notice is present: if context.rule_candidates is long, call narrow_candidates; use get_task_facts "
-    "to decide which candidates the notice's condition applies to (origin, customs, permits, phase); "
-    "check_schedule_slack with the bound; if every applicable task absorbs it stop with M2; otherwise "
-    "simulate_conditional (kind hold_after_start); call search_risk_signals once only if applicability stays unclear. "
-    "Call compare_responses only when the impact is certain and nothing is left for a person to confirm. "
+    "Read context.risk_register first. If the supplier notice or the external notice shares the cause of a "
+    "registered risk, set investigation.risk_link to that risk_id with one Korean sentence saying which cause "
+    "and which items or tasks they share; otherwise null. "
+    "What a person needs from you: for every task or purchase item the change may cover, whether its task absorbs "
+    "the duration bound a notice states (check_schedule_slack with that bound) and, for each one that does not, the "
+    "worst-case finish and the latest date to act (simulate_conditional with that bound and its quote). Have those "
+    "numbers before you ask a person anything, so the question can carry them. Stop earlier only with M1 (not "
+    "related), M2 (every applicable task absorbs the bound) or M3 (no duration stated). "
+    "When context.supplier_notice is present: context.reported_change already holds the calculated effect of what "
+    "the supplier reported, so do not re-check it. Whether the supplier's stated reason and a context.related_signals "
+    "quote share a cause decides everything; if they do not, stop with M1. If they do, the same condition may cover "
+    "purchase items the supplier did not mention; find_procurement_items looks them up (supplier_id and "
+    "origin_country from context.mentioned_items, the named item's supplier rather than the owner of a logistics "
+    "task, and arriving_after from that item's planned_arrival). "
+    "When context.notice is present: decide which tasks the notice's condition applies to (origin, customs, "
+    "permits, phase). If context.auto_narrow is present the rule candidates are already sorted: do not sort them "
+    "again. Otherwise narrow_candidates sorts a long context.rule_candidates list. get_task_facts shows a task's "
+    "attributes and purchase items. "
+    "The tools refuse what is not yet allowed: bound_days and holds use only durations, dates and quotes stated in "
+    "the notices; simulate_conditional needs check_schedule_slack on the same tasks first; compare_responses needs "
+    "a simulate_conditional result and is refused while items the supplier did not mention await a person's "
+    "confirmation. A task that absorbs the bound needs no conditional schedule. search_risk_signals takes one query "
+    "id from context.case_queries, at most once, and only helps when applicability is unclear. "
     "Stops: M1 not related, M2 no finish impact, M3 duration not stated, M4 a person must confirm a fact, "
     "M5 cannot calculate, done compared responses. "
     'Return only JSON: {"summary": Korean string, "status": "completed|needs_input|needs_review", '
     '"stop_reason": Korean string, "investigation": {"stop": "M1|M2|M3|M4|M5|done", '
     '"cause_link": {"signal_event_id", "supplier_quote", "signal_quote"} or null, '
+    '"risk_link": {"risk_id", "reason"} or null, '
     '"items": [{"item_id", "task_id", "absorbs", "latest_action_date", "worst_case_finish"}], '
     '"applicable_task_ids": [], "excluded": [{"task_id", "reason"}], '
     '"question": one Korean question for a person or "", "checks": [one short Korean line per tool call: what it showed]}, '
@@ -326,7 +359,8 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
     from .adapters.llm import OpenAICompatibleLLM
     from .agent import run_agent
     from .external_risks import combine_patches, interpret_notice
-    from .risk_signals import search_risk_signals as lookup_risk_signals
+    from .risk_register import model_view
+    from .risk_signals import CASE_QUERIES, search_cases
     from .shifted_external import recheck_shifted_schedule
 
     if not agent_enabled():
@@ -345,6 +379,7 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         from .hero_demo import hero_response_options
         options = hero_response_options(project, tasks)
     rows = db.list_json("events", run["project_id"], 1000)
+    register = model_view(db, run["project_id"])
     supplier = event.get("channel") == "supplier_message"
     base_patch = (event.get("patch") or {}) if supplier else {}
     baseline_finish = max(str(task["baseline_finish"])[:10] for task in tasks)
@@ -372,6 +407,21 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
     durations = {fact["value"] for fact in facts if fact["kind"] == "max_duration_days"}
     literal_dates = {fact["value"] for fact in facts if fact["kind"] == "date"}
     state: dict[str, Any] = {"slack_checked": set(), "conditional": None, "usage": {}, "risk_searches": 0}
+    # A triaged notice is investigated on its related tasks plus the needs-check tasks a person picked;
+    # the other needs-check tasks stay on the card for a person and are not calculated.
+    triaged = {} if supplier else (event.get("auto_narrow") or {})
+    selected_ids = [str(task_id) for task_id in (run.get("data") or {}).get("include_task_ids") or []]
+    scope: set[str] | None = None
+    if triaged.get("status") == "interpreted":
+        scope = ({str(row.get("task_id")) for row in triaged.get("related") or []}
+                 | ({str(row.get("task_id")) for row in triaged.get("needs_check") or []} & set(selected_ids)))
+
+    def out_of_scope(task_ids: list[str]) -> dict[str, Any] | None:
+        outside = sorted(set(map(str, task_ids)) - scope) if scope is not None else []
+        if not outside:
+            return None
+        return {"status": "rejected", "outside_scope": outside, "allowed_task_ids": sorted(scope),
+                "reason": "자동 추리기의 '관련 있음' 작업과 사람이 고른 '확인 필요' 작업만 계산합니다."}
 
     def find_procurement_items(reason: str, supplier_id: str = "", origin_country: str = "",
                                customs_required: bool = True, arriving_after: str = "") -> dict[str, Any]:
@@ -387,6 +437,9 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         if bound_days and bound_days not in durations:
             return {"status": "rejected", "reason": "기간 상한은 공지 원문에 적힌 값만 쓸 수 있습니다.",
                     "stated_durations": sorted(durations)}
+        refused = out_of_scope(task_ids)
+        if refused:
+            return refused
         state["slack_checked"].update(task_ids)
         return inv.schedule_slack(project, tasks, task_ids, base_patch, bound_days or None)
 
@@ -403,6 +456,9 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
             patch, applied = inv.conditional_changes(tasks, procurement, changes)
         except ValueError as exc:
             return {"status": "rejected", "reason": str(exc)}
+        refused = out_of_scope([row["task_id"] for row in applied])
+        if refused:
+            return refused
         if any(row["task_id"] not in state["slack_checked"] for row in applied):
             return {"status": "rejected", "reason": "먼저 check_schedule_slack으로 해당 작업의 여유를 확인하세요."}
         combined = combine_patches([base_patch, patch])
@@ -429,25 +485,23 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
                            "extra_cost_krw": result.get("extra_cost_krw"), "target_met": result.get("target_met")})
         return {"scenarios": briefs, "conditional": True}
 
-    def search_risk_signals(reason: str, risk_type: str = "", stage: str = "") -> dict[str, Any]:
-        """L2 real-world cases for judging applicability; cases after the notice are reference only."""
+    def search_risk_signals(reason: str, query: str) -> dict[str, Any]:
+        """L2 real-world cases for one query id from context.case_queries; cases after the notice are reference only."""
         state["risk_searches"] += 1
         if state["risk_searches"] > 1:
             return {"status": "limit_reached"}
-        result = lookup_risk_signals(risk_type=risk_type, stage=stage, limit=5)
-        as_of = str(event.get("published_at") or "")[:10]
-        for row in result["results"]:
-            row["temporal_status"] = ("POST_AS_OF_REFERENCE" if as_of and str(row.get("published_date") or "") > as_of
-                                      else "AVAILABLE_AS_OF")
-            row["summary"] = str(row.get("summary") or "")[:200]
-        return result
+        return search_cases(query, str(event.get("published_at") or "")[:10])
 
     def narrow_candidates(reason: str) -> dict[str, Any]:
-        """Ask the notice interpreter for quoted task candidates when the rule list is long."""
-        result = interpret_notice(event, tasks, OpenAICompatibleLLM())
+        """Ask the notice interpreter to sort a long rule-candidate list with quotes."""
+        result = interpret_notice(event, tasks, OpenAICompatibleLLM(timeout=SORT_TIMEOUT), procurement, register)
         state["usage"] = {**(result.get("usage") or {}), "llm_calls": 1}
-        return {"candidates": result.get("candidates") or [], "status": result.get("status")}
+        return {"status": result.get("status"), "candidates": result.get("candidates") or [],
+                "unrelated_count": len(result.get("unrelated") or [])}
 
+    search_risk_signals.parameters_schema = {  # type: ignore[attr-defined]
+        "type": "object", "required": ["reason", "query"], "additionalProperties": False,
+        "properties": {"reason": {"type": "string"}, "query": {"type": "string", "enum": sorted(CASE_QUERIES)}}}
     simulate_conditional.parameters_schema = {  # type: ignore[attr-defined]
         "type": "object", "required": ["reason", "changes"], "additionalProperties": False,
         "properties": {"reason": {"type": "string"}, "changes": {"type": "array", "items": {
@@ -460,10 +514,12 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
                              "search_risk_signals": search_risk_signals, "find_procurement_items": find_procurement_items}
     by_id = {str(task["task_id"]): task for task in tasks}
     context: dict[str, Any] = {
-        "_llm_gateway": OpenAICompatibleLLM(),
+        "_llm_gateway": OpenAICompatibleLLM(timeout=FINAL_ANSWER_TIMEOUT),
         "project": {key: project.get(key) for key in ("project_name", "target_finish", "country") if project.get(key)},
         "baseline_finish": baseline_finish,
         "facts": facts,
+        "risk_register": register,
+        "case_queries": {key: value["label"] for key, value in CASE_QUERIES.items()},
     }
     if supplier:
         context["supplier_notice"] = {key: event.get(key) for key in ("source_label", "content", "published_at",
@@ -476,7 +532,20 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         # The purchase item the supplier names carries the supplier and origin; the task owner may be a forwarder.
         context["mentioned_items"] = inv.mentioned_items(str(event.get("content") or ""), procurement)
     else:
-        tools["narrow_candidates"] = narrow_candidates
+        if scope is not None:
+            # Sorted once when the change was detected; the loop does not pay to sort it again.
+            needs_check = triaged.get("needs_check") or []
+            chosen = [row for row in needs_check if str(row.get("task_id")) in scope]
+            context["auto_narrow"] = {
+                "related": [{key: row.get(key) for key in ("task_id", "quote")} for row in triaged.get("related") or []],
+                "unrelated_count": len(triaged.get("unrelated") or []),
+                "needs_check_left_for_person_count": len(needs_check) - len(chosen)}
+            if chosen:
+                context["auto_narrow"]["needs_check_selected_by_person"] = [
+                    {"task_id": row.get("task_id"), "quote": row.get("quote"), "reason": (row.get("reasons") or [""])[0]}
+                    for row in chosen]
+        else:
+            tools["narrow_candidates"] = narrow_candidates
         context["notice"] = {key: event.get(key) for key in ("title", "content", "published_at", "source_label")}
         context["rule_candidates"] = [{"task_id": row.get("task_id"), "name": (by_id.get(str(row.get("task_id"))) or {}).get("name"),
                                        "reasons": row.get("reasons")} for row in (event.get("candidates") or [])][:40]
@@ -499,6 +568,9 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
                 "linked_notices": [], "notify": True}
     record = output.get("investigation") or {"stop": "M5"}
     stop = record["stop"]
+    # At M1 the supplier's reason is not the signal's cause, so this notice cannot show the risk occurring.
+    risk_link = (None if supplier and stop == "M1"
+                 else _link_investigation(db, run, event, record.get("risk_link"), supplier))
     # A question about an item that cannot absorb the hold must carry the date to act by.
     deadlines = [row for entry in output.get("tool_log") or [] if entry.get("tool") == "simulate_conditional"
                  and entry.get("status") == "ok" and (entry.get("result") or {}).get("status") != "rejected"
@@ -539,11 +611,35 @@ def _run_investigation(db: Store, run: dict[str, Any]) -> dict[str, Any]:
                 fingerprint=event_row["fingerprint"], created_at=event_row["created_at"])
     return {"status": stop, "summary": output.get("summary"), "agent": output, "action_ids": action_ids,
             "related_signals": signals, "real_case_basis": basis, "agent_found_cases": found_cases,
-            "rules_only": rules_only, "linked_notices": [
+            "rules_only": rules_only, "risk_link": risk_link, "linked_notices": [
                 {key: (next((row["data"] for row in rows if row["id"] == signal["event_id"]), {}) or {}).get(key)
                  for key in ("title", "content", "published_at")} | {"event_id": signal["event_id"]}
                 for signal in signals],
             "notify": stop not in {"M1", "M2"}}
+
+
+def _link_investigation(db: Store, run: dict[str, Any], event: dict[str, Any], proposed: Any,
+                        supplier: bool) -> dict[str, Any] | None:
+    """Record the register risk the agent tied this notice to: a supplier notice means it occurred."""
+    from .risk_register import STATUS_LABEL, get_risk, link
+
+    if not isinstance(proposed, dict) or not proposed.get("risk_id"):
+        return None
+    before = get_risk(db, run["project_id"], str(proposed["risk_id"]))
+    if not before:
+        return None
+    status = "OCCURRED" if supplier else "SIGNAL_DETECTED"
+    source = event.get("source_label") or event.get("title") or "통보"
+    risk = link(db, run["project_id"], before["risk_id"], status, "investigation",
+                str(proposed.get("reason") or "")[:300] or f"{source}가 같은 원인입니다.",
+                event_id=run["event_id"], run_id=run["id"])
+    expected = next((row for row in before.get("history") or [] if row.get("status") == "EXPECTED"), {})
+    return {"risk_id": risk["risk_id"], "title": risk["title"], "linked_cause": risk.get("linked_cause"),
+            "reason": proposed.get("reason"),
+            "status": risk["status"], "status_label": STATUS_LABEL[risk["status"]],
+            "previous_status": before.get("status"), "expected_at": expected.get("at"),
+            "expected_by": expected.get("actor"), "item_ids": risk.get("item_ids"),
+            "critical_warnings": risk.get("critical_warnings") or [], "vulnerability": risk.get("vulnerability")}
 
 
 def _agent_found_cases(output: dict[str, Any]) -> list[dict[str, Any]]:
@@ -603,6 +699,49 @@ def _interpretation_agent(result: dict[str, Any], source: str) -> dict[str, Any]
             "summary": summary, "candidates": candidates, "usage": usage}
 
 
+def _auto_narrow(db: Store, run: dict[str, Any], event: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Sort a newly detected notice's rule candidates once, on its own daily limit; never a schedule change.
+
+    The result is kept apart from the event's related tasks so a later supplier notice still links
+    to this notice by the rule candidates. Related and needs-check results only offer an
+    investigation; nothing starts one.
+    """
+    from .risk_register import link, model_view
+
+    rules = [row for row in event.get("candidates") or [] if row.get("task_id")]
+    record: dict[str, Any] = {"at": utcnow(), "rule_candidate_count": len(rules), "related": [],
+                              "needs_check": [], "unrelated": [], "risk_links": []}
+    if not rules:
+        return {**record, "status": "no_candidates",
+                "summary": "규칙 후보가 없어 LLM을 부르지 않고 무관으로 정리했습니다."}
+    if not agent_enabled():
+        return {**record, "status": "agent_off", "summary": "에이전트가 꺼져 있어 규칙 후보만 남겼습니다."}
+    paid_state = _reserve_paid_attempt(db, run["id"], ledger="auto_usage_ledger")
+    if paid_state != "reserved":
+        return {**record, "status": paid_state, "limit": auto_triage_limit(),
+                "summary": f"자동 추리기 일일 한도({auto_triage_limit()}회)에 도달해 규칙 후보만 남겼습니다."}
+    from .adapters.llm import OpenAICompatibleLLM
+    from .external_risks import interpret_notice
+
+    result = interpret_notice(event, snapshot["tasks"], OpenAICompatibleLLM(timeout=SORT_TIMEOUT), snapshot.get("procurement") or [],
+                              model_view(db, run["project_id"]))
+    _record_usage(db, run["id"], result, ledger="auto_usage_ledger")
+    if result.get("status") != "interpreted":
+        return {**record, "status": "interpretation_failed",
+                "summary": "자동 추리기가 공지를 해석하지 못해 규칙 후보만 남겼습니다."}
+    title = event.get("title") or event.get("source_label")
+    for row in result["risk_links"]:
+        link(db, run["project_id"], row["risk_id"], "SIGNAL_DETECTED", "triage",
+             f"외부 공지 '{title}'가 같은 원인을 다룹니다.", event_id=run["event_id"], run_id=run["id"],
+             quote=row["quote"])
+    counts = {name: len(result[name]) for name in ("related", "needs_check", "unrelated")}
+    return {**record, "status": "interpreted", "result": result,
+            "usage": {**(result.get("usage") or {}), "llm_calls": 1},
+            **{name: result[name] for name in ("related", "needs_check", "unrelated", "risk_links")},
+            "summary": f"관련 있음 {counts['related']}건, 확인 필요 {counts['needs_check']}건, "
+                       f"무관 {counts['unrelated']}건으로 추렸습니다."}
+
+
 def _run_analysis(db: Store, run: dict[str, Any]) -> dict[str, Any]:
     from .scheduling import calendar_shift_days, simulate
 
@@ -638,14 +777,34 @@ def _run_analysis(db: Store, run: dict[str, Any]) -> dict[str, Any]:
         return {"status": "SUPERSEDED", "summary": "보류되었거나 최신 근거로 대체된 변경입니다.", "scenario_ids": []}
     if event.get("version_id") and event["version_id"] != version["id"]:
         return {"status": "STALE", "summary": "기준 일정이 바뀌었습니다. 외부 소스를 다시 확인하세요.", "scenario_ids": []}
+    if (run_data.get("auto_detected") and event.get("channel") == "registered_public_source"
+            and not event.get("patch") and not event.get("auto_narrow")):
+        event["auto_narrow"] = _auto_narrow(db, run, event, snapshot)
+        db.put_json("events", event_row["id"], event, project_id=run["project_id"],
+                    fingerprint=event_row["fingerprint"], created_at=event_row["created_at"])
     if not event.get("patch") and event.get("evidence") and event.get("channel") in {"registered_public_source", "evidence_document"}:
         # Interpret source evidence before the early NEEDS_INPUT return.
-        if interpret_llm:
+        triaged = event.get("auto_narrow") or {}
+        if interpret_llm and triaged.get("status") == "interpreted":
+            # The automatic triage already read this notice; a person's analysis uses it without a new call.
+            result = {**triaged["result"], "usage": {}}
+            supplier_agent = {**_interpretation_agent(result, "외부 근거"), "usage": {"llm_calls": 0},
+                              "reused": "auto_narrow"}
+            supplier_agent["summary"] = "변화 자동 추리기 결과를 그대로 씁니다(추가 호출 없음). " + supplier_agent["summary"]
+            event["interpretation"] = result
+            if result.get("candidates"):
+                event["candidates"] = result["candidates"]
+                event["related_task_ids"] = [item["task_id"] for item in result["candidates"]]
+            db.put_json("events", event_row["id"], event, project_id=run["project_id"],
+                        fingerprint=event_row["fingerprint"], created_at=event_row["created_at"])
+        elif interpret_llm:
             paid_state = _reserve_paid_attempt(db, run["id"])
             if paid_state == "reserved":
                 from .external_risks import interpret_notice
                 from .adapters.llm import OpenAICompatibleLLM
-                result = interpret_notice(event, tasks, OpenAICompatibleLLM())
+                from .risk_register import model_view
+                result = interpret_notice(event, tasks, OpenAICompatibleLLM(timeout=SORT_TIMEOUT), snapshot.get("procurement") or [],
+                                          model_view(db, run["project_id"]))
                 _record_usage(db, run["id"], result)
                 paid_reserved = True
                 supplier_agent = _interpretation_agent(result, "외부 근거")
@@ -1132,28 +1291,53 @@ def enqueue_due_scans(db: Store, now: datetime | None = None) -> int:
     return queued
 
 
-def _run_watch_plan_enrichment(db: Store, run: dict[str, Any]) -> dict[str, Any]:
-    if not agent_enabled():
-        return {"status": "rules_only", "summary": "LLM 보강이 꺼져 있어 기본 제안을 유지합니다."}
-    version = db.get_json("versions", run["version_id"], run["project_id"])
-    watch = db.get_json("watch_plans", run["project_id"])
-    if not version or not watch:
-        return {"status": "stale", "summary": "기준 일정 또는 감시 계획을 찾을 수 없습니다."}
-    if db.current_version(run["project_id"])["id"] != version["id"]:
-        return {"status": "stale", "summary": "새 기준 일정이 등록되어 보강을 건너뜁니다."}
-    paid_state = _reserve_paid_attempt(db, run["id"])
-    if paid_state != "reserved":
-        return {"status": paid_state, "summary": "유료 호출 한도로 기본 제안을 유지합니다."}
-    from .adapters.llm import OpenAICompatibleLLM
-    from .watch_suggestions import enrich_watch_plan
-    plan = dict(watch["data"])
-    plan["proposal_items"] = [dict(item) for item in plan.get("proposal_items", [])]
-    output = enrich_watch_plan(plan, version["data"]["tasks"], OpenAICompatibleLLM())
-    _record_usage(db, run["id"], output)
-    if output["status"] == "enriched":
-        db.put_json("watch_plans", run["project_id"], plan)
-    return output
+def _run_baseline_briefing(db: Store, run: dict[str, Any]) -> dict[str, Any]:
+    """Brief the top risks of a new baseline and fill the register; then enrich the watch plan.
 
+    The calculator ranks the risks whether or not the agent is on. With the agent on, one paid
+    attempt covers the agent's review of the candidates and the watch-plan enrichment.
+    """
+    from . import briefing as brief
+    from .risk_register import register_expected
+
+    version = db.get_json("versions", run["version_id"], run["project_id"])
+    current = db.current_version(run["project_id"])
+    if not version or not current or current["id"] != version["id"]:
+        return {"status": "stale", "summary": "새 기준 일정이 등록되어 브리핑을 건너뜁니다."}
+    snapshot = version["data"]
+    project, tasks, procurement = snapshot["project"], snapshot["tasks"], snapshot.get("procurement") or []
+    rules = brief.rule_briefing(project, tasks, procurement)
+    agent: dict[str, Any] | None = None
+    paid_state = _reserve_paid_attempt(db, run["id"]) if agent_enabled() else "disabled"
+    if paid_state == "reserved":
+        from .adapters.llm import OpenAICompatibleLLM
+        from .agent import run_agent
+        agent = brief.agent_review(project, tasks, procurement, rules, run_agent, OpenAICompatibleLLM())
+        _record_usage(db, run["id"], agent)
+    result = brief.finalize(project, tasks, procurement, rules, agent if agent and agent.get("status") not in
+                            {"llm_unavailable", "failed"} else None)
+    if agent is None:
+        mode = {"disabled": "rules_only"}.get(paid_state, paid_state)
+        summary = ("에이전트가 꺼져 있어 규칙과 계산기로만 순위를 정했습니다." if paid_state == "disabled"
+                   else "유료 호출 한도로 규칙과 계산기로만 순위를 정했습니다.")
+        agent_view = {"status": mode, "mode": "rules_only", "summary": summary}
+    else:
+        agent_view = {key: agent.get(key) for key in ("status", "summary", "tool_log", "usage", "unresolved_items")}
+        agent_view["mode"] = "agent_review"
+    register_expected(db, run["project_id"], version["id"], result["risks"])
+    watch = db.get_json("watch_plans", run["project_id"])
+    enrichment: dict[str, Any] = {"status": "skipped"}
+    if paid_state == "reserved" and watch:
+        from .adapters.llm import OpenAICompatibleLLM
+        from .watch_suggestions import enrich_watch_plan
+        plan = dict(watch["data"])
+        plan["proposal_items"] = [dict(item) for item in plan.get("proposal_items", [])]
+        enrichment = enrich_watch_plan(plan, tasks, OpenAICompatibleLLM())
+        _record_usage(db, run["id"], enrichment)
+        if enrichment.get("status") == "enriched":
+            db.put_json("watch_plans", run["project_id"], plan)
+    return {"status": "succeeded", "summary": f"등록 시 위험 {len(result['risks'])}개를 브리핑했습니다.",
+            "briefing": result, "agent": agent_view, "watch_plan_enrichment": {"status": enrichment.get("status")}}
 
 def run_once(db: Store | None = None) -> bool:
     db = db or Store()
@@ -1167,8 +1351,8 @@ def run_once(db: Store | None = None) -> bool:
             result = _run_scan(db, run)
         elif run["kind"] == "document_ingest":
             result = _run_document_ingest(db, run)
-        elif run["kind"] == "watch_plan_enrich":
-            result = _run_watch_plan_enrichment(db, run)
+        elif run["kind"] in {"baseline_briefing", "watch_plan_enrich"}:
+            result = _run_baseline_briefing(db, run)
         elif run["kind"] == "investigation":
             paid_state = _reserve_paid_attempt(db, run["id"]) if agent_enabled() else "disabled"
             result = (_run_investigation(db, run) if paid_state in {"reserved", "disabled"}

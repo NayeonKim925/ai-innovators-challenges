@@ -23,7 +23,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services" / "api"))
 CASSETTE = ROOT / "data" / "llm_replay" / "hero_demo.json"
-FLOWS = ("H04", "H02", "V08", "EXT_NOTICE", "EXT_HOLIDAY", "X2", "X2-C", "X1-A", "X1-B", "X2-resolved")
+FLOWS = ("BRIEF", "H04", "H02", "V08", "EXT_NOTICE", "EXT_HOLIDAY", "X2", "X2-C", "X1-A", "X1-B", "X2-resolved")
 SYNTHETIC_NOTICE = {
     "status": "ok", "source_id": "https://environment.ec.europa.eu/news_en", "provider": "registered_source",
     "url": "https://environment.ec.europa.eu/news_en", "fetched_at": "2025-08-27T08:00:00+00:00",
@@ -68,6 +68,10 @@ def _patch_sources(patch: Any = setattr) -> None:
         return {"status": "failed", "source_id": "open-meteo", "fetched_at": "2025-08-27T00:00:00+00:00",
                 "error": "weather is not fetched in agent flows"}
 
+    from app import watch_suggestions
+
+    # Watch-plan enrichment is not part of these flows; the briefing that runs beside it is.
+    patch(watch_suggestions, "enrich_watch_plan", lambda *_args, **_kwargs: {"status": "skipped", "usage": {}})
     patch(sources, "fetch_holidays", local_holidays)
     patch(sources, "fetch_registered_source", lambda *_args, **_kwargs: dict(SYNTHETIC_NOTICE))
     patch(sources, "fetch_weather", no_weather)
@@ -117,7 +121,6 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
     from app.storage import Store
     from app.worker import run_once
 
-    llm_mode = os.environ["REPLAN_LLM_MODE"]
     client = TestClient(api.app)
     headers = {"Authorization": f"Bearer {os.environ['REPLAN_DEMO_TOKEN']}"}
 
@@ -140,26 +143,45 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
                     "label", "option_ids", "finish_date", "supplier_finish_shift_days",
                     "external_additional_shift_days", "recovery_days_vs_no_response")} for row in run["scenarios"]]}
 
-    def investigate(event_id: str) -> dict:
-        queued = call("POST", f"/api/projects/{project_id}/events/{event_id}/investigations")
+    def investigate(event_id: str, include: list[str] | None = None) -> dict:
+        queued = call("POST", f"/api/projects/{project_id}/events/{event_id}/investigations",
+                      {"include_task_ids": include} if include else None)
         drain()
         run = call("GET", f"/api/runs/{queued['run_id']}")["run"]
         return {"agent": run["data"].get("agent"), "status": run["data"].get("status"), "run_id": run["id"],
                 "action_ids": run["data"].get("action_ids"), "run_status": run["status"]}
 
+    def triage(event_id: str) -> dict:
+        event = next(row["data"] for row in call("GET", f"/api/projects/{project_id}")["events"] if row["id"] == event_id)
+        narrow = event.get("auto_narrow") or {}
+        return {"status": narrow.get("status"), "agent": {"summary": narrow.get("summary"), "usage": narrow.get("usage")},
+                "related": [row["task_id"] for row in narrow.get("related") or []],
+                "needs_check": [row["task_id"] for row in narrow.get("needs_check") or []],
+                "unrelated_count": len(narrow.get("unrelated") or []),
+                "risk_links": [row["risk_id"] for row in narrow.get("risk_links") or []]}
+
     # The display name never reaches the model, so any name replays (as a project made on screen does).
     project_id = call("POST", "/api/projects", {"name": project_name, "mode": "REPLAY"})["project_id"]
-    # Watch-plan enrichment is not part of these flows.
-    os.environ["REPLAN_LLM_MODE"], os.environ["REPLAN_PAID_CALLS_ENABLED"] = "live", "false"
+    os.environ["REPLAN_PAID_CALLS_ENABLED"] = "true"
+    # Every flow starts as the screen does: the baseline is briefed and the register filled first.
     call("POST", f"/api/projects/{project_id}/demo/hero-baseline")
     drain()
-    os.environ["REPLAN_LLM_MODE"], os.environ["REPLAN_PAID_CALLS_ENABLED"] = llm_mode, "true"
     project = call("GET", f"/api/projects/{project_id}")
     runs: dict[str, dict] = {}
+    if flow == "BRIEF":
+        brief = project.get("briefing") or {}
+        runs["briefing"] = {"status": (brief.get("agent") or {}).get("status"), "agent": brief.get("agent"),
+                            "risks": [{key: risk.get(key) for key in ("risk_id", "title", "item_ids", "min_float_days",
+                                                                      "critical_warnings", "agent_note")}
+                                      for risk in (brief.get("briefing") or {}).get("risks") or []],
+                            "excluded": (brief.get("briefing") or {}).get("excluded")}
+        return runs
 
     if flow in {"X2", "X2-C", "X2-resolved"}:
-        call("POST", f"/api/projects/{project_id}/demo/external-signals/N-X2")
+        # As on screen: starting the watch simulates one collection, which brings in N-X2.
+        notice_id = call("POST", f"/api/projects/{project_id}/watch/start")["event_ids"][0]
         drain()
+        runs["triage"] = triage(notice_id)
     if flow in {"H04", "H02", "V08", "X2", "X2-C", "X2-resolved"}:
         if flow == "V08":
             variants = json.loads((ROOT / "data/hero_demo/supplier_message_variants.json").read_text(encoding="utf-8"))
@@ -183,6 +205,7 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
         runs["confirmed"] = analyse(event_id, False)
         if flow in {"X2", "X2-C", "X2-resolved"}:
             runs["investigation"] = investigate(event_id)
+            runs["investigation"]["risk_link"] = call("GET", f"/api/runs/{runs['investigation']['run_id']}")["run"]["data"].get("risk_link")
         if flow == "X2-resolved":
             # A person confirms P-C is affected; the schedule is recalculated with its hold.
             resolved = call("POST", f"/api/projects/{project_id}/investigations/{runs['investigation']['run_id']}/resolve",
@@ -196,7 +219,12 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
     elif flow in {"X1-A", "X1-B"}:
         event_id = call("POST", f"/api/projects/{project_id}/demo/external-signals/{flow}")["event_ids"][0]
         drain()
-        runs["investigation"] = investigate(event_id)
+        runs["triage"] = triage(event_id)
+        # X1-B: when the triage leaves T013 for a person to check, the person picks it (as on screen).
+        picked = ["T013"] if flow == "X1-B" and "T013" in runs["triage"]["needs_check"] else None
+        runs["investigation"] = investigate(event_id, picked)
+        runs["investigation"]["picked_by_person"] = picked or []
+        runs["investigation"]["risk_link"] = call("GET", f"/api/runs/{runs['investigation']['run_id']}")["run"]["data"].get("risk_link")
     else:
         plan = dict(project["watch_plan"])
         keep = "holiday:HU:2027" if flow == "EXT_HOLIDAY" else "source:"
@@ -215,6 +243,8 @@ def run_flow(flow: str, mode: str, project_name: str = "에이전트 흐름 확�
         auto = next(row for row in project["runs"] if row.get("kind") == "analysis")
         runs["auto_detected"] = {"agent": auto["data"].get("agent"), "status": auto["data"].get("status")}
         event_id = next(row["id"] for row in project["events"] if row["data"].get("evidence"))
+        if flow == "EXT_NOTICE":
+            runs["triage"] = triage(event_id)
         if flow == "EXT_HOLIDAY":
             call("PATCH", f"/api/projects/{project_id}/events/{event_id}/review",
                  {"confirmed": True, "review_note": "현장 휴무 달력과 대조해 적용 확인"})
@@ -248,7 +278,7 @@ def main() -> int:
             results[flow] = run_flow(flow, args.mode, args.project_name)
         for name, run in results[flow].items():
             agent = run.get("agent") or {}
-            state = run.get('status') if name == 'investigation' else agent.get('status', '-')
+            state = run.get('status') if name in {'investigation', 'triage', 'briefing'} else agent.get('status', '-')
             print(f"{flow:<12} {name:<14} {str(state):<16} {str(agent.get('summary') or '')[:70]}")
     report = {"mode": args.mode, "gateway_calls": counter["gateway"], "replayed_calls": counter["replayed"],
               "replay_misses": counter["misses"], "flows": results}

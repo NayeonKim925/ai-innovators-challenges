@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .adapters.llm import agent_enabled, llm_mode
 from .events import normalize_event
+from .risk_register import list_risks
 from .storage import Store, digest, identifier, utcnow
 
 
@@ -106,6 +107,7 @@ def normalize_import_snapshot(parsed: dict[str, Any], current_project: dict[str,
         profile["mode"] = "REPLAY"
         profile["data_origin"] = "SYNTHETIC"
         profile["status_as_of"] = hero["as_of_date"]
+        profile["evidence_as_of"] = hero.get("evidence_as_of_date") or hero["as_of_date"]
         profile["hero_fixture_id"] = hero["project_id"]
     calendars = overrides.calendars if overrides.calendars is not None else parsed.get("calendars", [])
     profile["nonworking_dates"] = [item.get("calendar_date") for item in calendars if item.get("scope") == profile.get("site_id") and item.get("calendar_date")]
@@ -246,6 +248,15 @@ class AnalysisInput(BaseModel):
 
 class ResolveInput(BaseModel):
     decision: str = Field(pattern="^(applies|not_applicable)$")
+    note: str = Field(default="", max_length=500)
+
+
+class InvestigationInput(BaseModel):
+    include_task_ids: list[str] = Field(default_factory=list, max_length=40)
+
+
+class RiskStatusInput(BaseModel):
+    status: str = Field(pattern="^(EXPECTED|SIGNAL_DETECTED|OCCURRED|RESPONDING|CLOSED)$")
     note: str = Field(default="", max_length=500)
 
 
@@ -590,7 +601,7 @@ def get_project(project_id: str) -> dict[str, Any]:
         "project": project["data"],
         "version": version,
         "watch_plan": watch["data"] if watch else None,
-        "events": db.list_json("events", project_id),
+        "events": _events_view(db.list_json("events", project_id), version),
         "source_snapshots": db.list_json("source_snapshots", project_id, 10),
         "runs": db.list_json("runs", project_id, 20),
         "actions": db.list_json("actions", project_id),
@@ -606,25 +617,73 @@ def get_project(project_id: str) -> dict[str, Any]:
         "llm_mode": llm_mode(),
         # Supplier notices with a same-period external change on the same tasks can be investigated.
         "related_signals": _related_signals_by_event(db, project_id, version),
+        "risks": list_risks(db, project_id),
+        "briefing": _latest_briefing(db, project_id, version),
         "versions": [dict(row) for row in version_rows],
         "approvals": [dict(row) for row in approval_rows],
     }
 
 
+def _latest_briefing(db: Store, project_id: str, version: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The newest briefing run of the current baseline, queued, running or done."""
+    if not version:
+        return None
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT id, status, data, updated_at FROM runs WHERE project_id=? AND kind IN ('baseline_briefing', "
+            "'watch_plan_enrich') AND version_id=? ORDER BY created_at DESC LIMIT 1", (project_id, version["id"]),
+        ).fetchone()
+    if not row:
+        return None
+    data = json.loads(row["data"])
+    return {"run_id": row["id"], "run_status": row["status"], "updated_at": row["updated_at"],
+            "briefing": data.get("briefing"), "agent": data.get("agent"), "summary": data.get("summary")}
+
+
 def _related_signals_by_event(db: Store, project_id: str, version: dict[str, Any] | None) -> dict[str, Any]:
+    from .hero_demo import loop_notice
     from .investigation import related_signals
 
     if not version:
         return {}
     rows = db.list_json("events", project_id, 1000)
+    by_id = {row["id"]: row["data"] for row in rows}
     found = {}
     for row in rows:
         data = row["data"]
         if data.get("channel") == "supplier_message" and data.get("patch") and data.get("review_status") not in {"REJECTED", "SUPERSEDED"}:
             signals = related_signals(data, rows, version["id"])["signals"]
+            for signal in signals:  # display-only source details; the worker reads related_signals directly
+                source = by_id.get(signal["event_id"], {})
+                url = str((source.get("evidence") or {}).get("url") or source.get("source_label") or "")
+                signal.update({"source_url": url if url.startswith("https://") else "",
+                               "source_host": url.split("/")[2] if url.startswith("https://") else str(source.get("source_label") or ""),
+                               "data_origin": source.get("data_origin"),
+                               "basis_risk_id": (loop_notice(str(source.get("demo_signal_id"))) or {}).get("basis_risk_id")
+                               if source.get("demo_signal_id") else None})
             if signals:
                 found[row["id"]] = signals
     return found
+
+
+def _events_view(rows: list[dict[str, Any]], version: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Adds outlet names and a one-line reason to stored real cases (display only, never model input).
+
+    Before the first analysis stores them, a supplier notice shows the same cases the analysis will store."""
+    from .risk_signals import case_relevance, evidence_for_supplier
+
+    tasks = (version or {}).get("data", {}).get("tasks") or []
+    for row in rows:
+        data = row["data"]
+        cases = data.get("risk_signal_evidence")
+        if cases is None and data.get("channel") == "supplier_message" and data.get("related_task_ids") and tasks:
+            cases = evidence_for_supplier(str(data.get("content") or ""), tasks, list(data["related_task_ids"]),
+                                          str(data.get("published_at") or data.get("received_at") or ""))
+        if isinstance(cases, list) and cases:
+            content = str(data.get("content") or "")
+            row["data"] = {**data, "risk_signal_evidence": [{**case, **case_relevance(content, str(case.get("risk_id")))}
+                                                             for case in cases if isinstance(case, dict)]}
+    return rows
 
 
 @app.post("/api/projects/{project_id}/demo/hero-baseline", dependencies=[Depends(authorize)])
@@ -643,14 +702,54 @@ async def import_hero_demo_baseline(project_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/demo/external-signals/{signal_id}", dependencies=[Depends(authorize)])
 def load_demo_signal(project_id: str, signal_id: str) -> dict[str, Any]:
-    """Record a bundled synthetic notice exactly as a registered-source scan would."""
-    from .hero_demo import HERO_PROJECT_ID, loop_notice
-    from .worker import _record_public_risks, _store_source_snapshot
-
+    """Record one bundled synthetic notice exactly as a registered-source scan would (test notices)."""
     db = store()
+    _require_hero(db, project_id)
+    created = _record_demo_signal(db, project_id, signal_id)
+    return {"event_ids": created, "duplicate": not created}
+
+
+# What the simulated collection of the hero demo finds when a person starts the watch.
+DEMO_WATCH_SIGNALS = ("N-X2",)
+
+
+@app.post("/api/projects/{project_id}/watch/start", dependencies=[Depends(authorize)])
+def start_watch(project_id: str) -> dict[str, Any]:
+    """Start the watch: the hero demo simulates one collection, other projects scan their enabled plan."""
+    db = store()
+    project = project_or_404(db, project_id)
+    if not db.current_version(project_id):
+        raise HTTPException(409, "confirm a baseline first")
+    from .hero_demo import HERO_PROJECT_ID
+
+    if project["data"].get("hero_fixture_id") == HERO_PROJECT_ID:
+        created = [event_id for signal_id in DEMO_WATCH_SIGNALS for event_id in _record_demo_signal(db, project_id, signal_id)]
+        mode, run_id = "demo_simulation", None
+    else:
+        watch = db.get_json("watch_plans", project_id)
+        if not watch or not watch["data"].get("enabled"):
+            raise HTTPException(409, "watch plan is disabled")
+        run = db.create_run(project_id, "scan", None, None, f"watch-start:{utcnow()}", {"watch_plan": watch["data"]})
+        created, mode, run_id = [], "scan", run["id"]
+    started = project["data"].get("watch_started_at") or utcnow()
+    db.put_json("projects", project_id, {**project["data"], "watch_started_at": started, "watch_mode": mode},
+                created_at=project["created_at"])
+    return {"mode": mode, "event_ids": created, "run_id": run_id, "watch_started_at": started}
+
+
+def _require_hero(db: Store, project_id: str) -> dict[str, Any]:
+    from .hero_demo import HERO_PROJECT_ID
+
     project = project_or_404(db, project_id)
     if not db.current_version(project_id) or project["data"].get("hero_fixture_id") != HERO_PROJECT_ID:
         raise HTTPException(409, "합성 외부 공지는 hero 데모 기준 일정에서만 불러올 수 있습니다")
+    return project
+
+
+def _record_demo_signal(db: Store, project_id: str, signal_id: str) -> list[str]:
+    from .hero_demo import loop_notice
+    from .worker import _record_public_risks, _store_source_snapshot
+
     notice = loop_notice(signal_id)
     if not notice:
         raise HTTPException(404, "signal not found")
@@ -666,7 +765,7 @@ def load_demo_signal(project_id: str, signal_id: str) -> dict[str, Any]:
         row = db.get_json("events", event_id, project_id)
         db.put_json("events", event_id, {**row["data"], "demo_signal_id": signal_id}, project_id=project_id,
                     fingerprint=row["fingerprint"], created_at=row["created_at"])
-    return {"event_ids": created, "duplicate": not created}
+    return created
 
 
 @app.post("/api/projects/{project_id}/imports", dependencies=[Depends(authorize)])
@@ -766,9 +865,8 @@ def confirm_import(project_id: str, import_id: str, value: ConfirmInput) -> dict
     db.put_json("projects", project_id, profile)
     suggestion = suggest_watch_plan(profile, tasks)
     db.put_json("watch_plans", project_id, suggestion)
-    if suggestion["proposal_items"] and agent_enabled():
-        db.create_run(project_id, "watch_plan_enrich", None, version_id,
-                      f"watch-plan-enrich:{version_id}", {})
+    # The worker briefs the baseline's top risks (rules always, the agent when on) and enriches the watch plan.
+    db.create_run(project_id, "baseline_briefing", None, version_id, f"baseline-briefing:{version_id}", {})
     return {"version_id": version_id, "version_hash": digest(snapshot), "task_count": len(tasks), "watch_plan_suggestion": suggestion}
 
 
@@ -893,8 +991,11 @@ def create_event(project_id: str, value: EventInput) -> dict[str, Any]:
 
 
 @app.post("/api/projects/{project_id}/events/{event_id}/investigations", status_code=202, dependencies=[Depends(authorize)])
-def start_investigation(project_id: str, event_id: str) -> dict[str, Any]:
-    """A person starts an investigation; nothing starts one automatically."""
+def start_investigation(project_id: str, event_id: str, value: InvestigationInput | None = None) -> dict[str, Any]:
+    """A person starts an investigation; nothing starts one automatically.
+
+    A triaged notice is investigated on its related tasks; a person may add needs-check tasks by ID.
+    """
     from .investigation import EXTERNAL_CHANNELS, related_signals
 
     db = store()
@@ -913,11 +1014,29 @@ def start_investigation(project_id: str, event_id: str) -> dict[str, Any]:
             raise HTTPException(409, "같은 기간·같은 작업의 외부 변화가 없어 조사할 것이 없습니다")
     elif event.get("channel") not in EXTERNAL_CHANNELS:
         raise HTTPException(409, "외부 변화 또는 협력사 통보만 조사할 수 있습니다")
+    include = sorted(set((value or InvestigationInput()).include_task_ids))
+    if include:
+        needs_check = {str(row.get("task_id")) for row in (event.get("auto_narrow") or {}).get("needs_check") or []}
+        if not set(include) <= needs_check:
+            raise HTTPException(422, "자동 추리기의 '확인 필요' 작업만 추가로 고를 수 있습니다")
     key = digest({"investigation": event_id, "event_hash": digest(event.get("patch") or event.get("content")),
-                  "version_id": version["id"]})
+                  "version_id": version["id"], **({"include": include} if include else {})})
     run = db.create_run(project_id, "investigation", event_id, version["id"], key,
-                        {"project_context_snapshot": db.project_context_snapshot(project_id)})
+                        {"project_context_snapshot": db.project_context_snapshot(project_id), "include_task_ids": include})
     return {"run_id": run["id"], "status": run["status"]}
+
+
+@app.patch("/api/projects/{project_id}/risks/{risk_id}", dependencies=[Depends(authorize)])
+def update_risk(project_id: str, risk_id: str, value: RiskStatusInput) -> dict[str, Any]:
+    """A person sets a register risk's status, forward or back, with a note kept in its history."""
+    from .risk_register import set_status
+
+    db = store()
+    project_or_404(db, project_id)
+    risk = set_status(db, project_id, risk_id, value.status, value.note.strip() or "사람이 상태를 바꿈")
+    if not risk:
+        raise HTTPException(404, "risk not found")
+    return {"risk": risk}
 
 
 @app.post("/api/projects/{project_id}/investigations/{run_id}/resolve", dependencies=[Depends(authorize)])
@@ -969,6 +1088,10 @@ def resolve_investigation(project_id: str, run_id: str, value: ResolveInput) -> 
     db.put_json("events", record["id"], event, project_id=project_id,
                 fingerprint=record.get("fingerprint"), created_at=record.get("created_at"))
     if applies:
+        from .risk_register import advance_linked
+
+        advance_linked(db, project_id, record["id"], "RESPONDING", "person",
+                       f"사람이 조사 결과를 확인함: {note}", run_id=run_id)
         analysis_run = db.create_run(project_id, "analysis", record["id"], version["id"],
                                      digest({"resolved": run_id, "patch": event["patch"]}),
                                      {"budget_krw": None, "preview_only": False, "resolved_from": run_id,
@@ -1348,6 +1471,8 @@ def usage() -> dict[str, Any]:
     db = store()
     with db.connection() as conn:
         rows = conn.execute("SELECT model, input_tokens, output_tokens, cost_usd, cost_status FROM usage_ledger ORDER BY created_at DESC").fetchall()
+        auto_rows = conn.execute("SELECT created_at FROM auto_usage_ledger WHERE created_at LIKE ?",
+                                 (utcnow()[:10] + "%",)).fetchall()
     items = [dict(row) for row in rows]
     known_cost = sum(item["cost_usd"] or 0 for item in items if item["cost_status"] == "KNOWN")
     return {
@@ -1357,4 +1482,6 @@ def usage() -> dict[str, Any]:
         "paid_calls_enabled": os.environ.get("REPLAN_PAID_CALLS_ENABLED", "false").lower() == "true",
         "llm_mode": llm_mode(),
         "daily_paid_run_limit": int(os.environ.get("REPLAN_MAX_PAID_RUNS_PER_DAY", "20")),
+        "auto_triage_today": len(auto_rows),
+        "daily_auto_triage_limit": int(os.environ.get("REPLAN_MAX_AUTO_TRIAGE_PER_DAY", "20")),
     }

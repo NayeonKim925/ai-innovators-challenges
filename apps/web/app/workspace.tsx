@@ -3,7 +3,9 @@
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import { ExternalWatch, EvidenceReview } from "./external-watch";
-import { STAGES, SectionId, deriveProgress, hasPatch, isPreview, runScenarioCount, sectionFromHash, stageSummary } from "./stages";
+import { Inbox, InboxMessage, demoInbox, toEventPayload } from "./inbox";
+import { BriefingPanel, RiskLinkNote, RiskRegister, TriagePanel } from "./risk-panels";
+import { STAGES, SectionId, deriveProgress, hasPatch, isFeedSignal, isPreview, linkedSignalIds, runScenarioCount, sectionFromHash, stageSummary, watchStarted } from "./stages";
 
 type Dict = Record<string, unknown>;
 type Row = Dict & { id?: string; data?: Dict; status?: string; kind?: string; event_id?: string; scenario_id?: string; created_at?: string };
@@ -34,6 +36,8 @@ type ProjectState = {
   agent_enabled?: boolean;
   llm_mode?: string;
   related_signals?: Record<string, Dict[]>;
+  risks?: Dict[];
+  briefing?: Dict | null;
   versions?: Row[];
   approvals?: Row[];
 };
@@ -100,7 +104,8 @@ function scenarioScore(data: Dict) {
   return "제약 확인";
 }
 
-const RUN_KIND: Record<string, string> = { analysis: "영향 분석", scan: "외부 출처 확인", watch_plan_enrich: "감시 계획 보강" };
+const RUN_KIND: Record<string, string> = { analysis: "영향 분석", scan: "외부 출처 확인", watch_plan_enrich: "등록 시 위험 브리핑",
+  baseline_briefing: "등록 시 위험 브리핑", investigation: "사후 조사" };
 const RUN_STATUS: Record<string, string> = { queued: "대기", running: "진행 중", succeeded: "완료", failed: "실패" };
 const ACTION_STATE: Record<string, string> = { OPEN: "확인 대기", ACCEPTED: "확인됨", REJECTED: "반려", DONE: "완료" };
 const PATCH_KIND: Record<string, string> = { estimated_finish: "완료 예정일", not_before: "착수 가능일", blocked_dates: "작업 불가일" };
@@ -158,7 +163,7 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
   const [selectedScenarioId, setSelectedScenarioId] = useState("");
   const [conditionNotes, setConditionNotes] = useState<Record<string, string>>({});
   const [manualMessage, setManualMessage] = useState("");
-  const [selectedDemoIndex, setSelectedDemoIndex] = useState(-1);
+  const [selectedMessageId, setSelectedMessageId] = useState("");
   const [budget, setBudget] = useState<number | "">("");
   const [notice, setNotice] = useState("프로젝트 작업공간을 불러오는 중입니다.");
   const [busy, setBusy] = useState(false);
@@ -220,8 +225,10 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
       const result = await callApi<RunResult>(`/api/runs/${runId}`);
       setRun(result);
       const approved = (value.approvals || []).find((item) => result.scenarios?.some((scenario) => scenario.id === item.scenario_id));
+      // Recommend only from the finished set; scenarios arrive one by one while the run is calculating.
+      const finished = ["succeeded", "failed"].includes(text(result.run?.status, ""));
       setSelectedScenarioId((current) => result.scenarios?.some((item) => item.id === current) ? current
-        : text(approved?.scenario_id, "") || recommendation(result.scenarios || []));
+        : text(approved?.scenario_id, "") || (finished ? recommendation(result.scenarios || []) : ""));
       settleAwaited(result);
     } else {
       setRun(null);
@@ -293,7 +300,7 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
   async function loadHeroBaseline() {
     await guarded("hero 데모 기준 일정 연결", () => callApi<Dict>(`/api/projects/${projectId}/demo/hero-baseline`, { method: "POST" }), async () => {
       await refresh();
-      setNotice("기준 일정을 연결했습니다. 일정을 확인한 뒤 '변경 불러오기'로 넘어가세요.");
+      setNotice("기준 일정을 연결했습니다. 사전 에이전트가 위험을 브리핑하면 이 화면에 표시됩니다. 확인한 뒤 '변경 불러오기'로 넘어가세요.");
     });
   }
 
@@ -345,38 +352,30 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
     go("changes", `review-${created.event_id}`);
   }
 
-  async function createEventFromDemo() {
-    const item = project.demo_events?.[selectedDemoIndex];
-    if (!item) return;
-    if (item.channel === "registered_public_source") {
-      // External notices enter the way a registered-source scan records them.
-      const loaded = await guarded("외부 공지 불러오기", () => callApi<{ event_ids: string[]; duplicate: boolean }>(
-        `/api/projects/${projectId}/demo/external-signals/${encodeURIComponent(text(item.signal_id))}`, { method: "POST" }));
-      setSelectedDemoIndex(-1);
-      if (!loaded) return;
-      await refresh();
-      setNotice(loaded.duplicate ? "이미 불러온 외부 공지입니다." : "외부 공지를 변경 카드로 등록했습니다. 규칙 후보만 표시하며, '조사 시작'을 눌러야 에이전트가 조사합니다.");
-      if (loaded.event_ids[0]) go("changes", `review-${loaded.event_ids[0]}`);
-      return;
-    }
-    if (item.event_id === "X2" && !(project.events || []).some((row) => row.data?.demo_signal_id === "N-X2")) {
-      // The lead demo needs its same-period notice on the board first, in the order it was recorded.
-      const notice = await guarded("같은 시기 외부 공지(N-X2) 불러오기", () => callApi<{ event_ids: string[] }>(
-        `/api/projects/${projectId}/demo/external-signals/N-X2`, { method: "POST" }));
-      if (!notice) return;
-    }
-    await createEvent({
-      event_id: text(item.event_id, "hero-change"),
-      corrects_event_id: item.corrects_event_id ? text(item.corrects_event_id) : undefined,
-      content: text(item.body || item.content),
-      channel: text(item.channel, "supplier_message"),
-      source_label: text(item.source_label, "가상 협력사 메시지"),
-      published_at: text(item.published_at),
-      mode: text(item.mode, "SYNTHETIC"),
-      data_origin: "SYNTHETIC",
-      simulation_as_of: text(item.published_at),
-    });
-    setSelectedDemoIndex(-1);
+  async function importInboxMessage(message: InboxMessage) {
+    await createEvent(toEventPayload(message));
+    setSelectedMessageId("");
+  }
+
+  // ---- 3 WATCH ---------------------------------------------------------
+  async function startWatch() {
+    const started = await guarded("감시 시작", () => callApi<{ mode: string; event_ids: string[] }>(
+      `/api/projects/${projectId}/watch/start`, { method: "POST" }));
+    if (!started) return;
+    await refresh();
+    setNotice(started.mode === "demo_simulation"
+      ? `감시를 시작했습니다. 데모 수집 시뮬레이션으로 등록 출처 공지 ${started.event_ids.length}건이 감시 피드에 들어왔고, 변화 자동 추리기가 분류합니다. 다음은 '변경 불러오기'입니다.`
+      : "감시를 시작했습니다. 등록한 출처를 확인하고 있습니다. 다음은 '변경 불러오기'입니다.");
+  }
+
+  async function loadTestNotice(signalId: string) {
+    // Test notices enter the way a registered-source scan records them.
+    const loaded = await guarded("테스트 공지 수집", () => callApi<{ event_ids: string[]; duplicate: boolean }>(
+      `/api/projects/${projectId}/demo/external-signals/${encodeURIComponent(signalId)}`, { method: "POST" }));
+    if (!loaded) return;
+    await refresh();
+    setNotice(loaded.duplicate ? "이미 들어온 공지입니다." : "테스트 공지를 감시 피드에 넣었습니다. 변화 자동 추리기가 한 번 분류합니다.");
+    if (loaded.event_ids[0]) go("watch", `review-${loaded.event_ids[0]}`);
   }
 
   async function createManualEvent() {
@@ -414,12 +413,20 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
     if (reviewed) await startAnalysis(eventId);
   }
 
-  async function startInvestigation(eventId: string) {
+  async function startInvestigation(eventId: string, include: string[] = []) {
     const queued = await guarded("조사 시작", () => callApi<{ run_id: string }>(
-      `/api/projects/${projectId}/events/${eventId}/investigations`, { method: "POST" }));
+      `/api/projects/${projectId}/events/${eventId}/investigations`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ include_task_ids: include }),
+      }));
     if (!queued) return;
     await refresh();
     setNotice("조사를 시작했습니다. 결과는 이 변경 카드에 표시됩니다.");
+  }
+
+  async function updateRisk(riskId: string, status: string, note: string) {
+    await guarded("리스크 상태 기록", () => callApi<Dict>(`/api/projects/${projectId}/risks/${encodeURIComponent(riskId)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, note }),
+    }), async () => { await refresh(); setNotice("리스크 대장에 상태를 기록했습니다."); });
   }
 
   async function resolveInvestigation(runId: string, decision: "applies" | "not_applicable", note: string) {
@@ -623,7 +630,10 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
   }
 
   // ---- Derived view state --------------------------------------------
-  const progress = useMemo(() => deriveProgress(project), [project]);
+  // On the comparison and execution screens the rail follows the change whose result is shown.
+  const shownEventId = activeSection === "scenarios" || activeSection === "execute" ? text(run?.run?.event_id, "") : "";
+  const progress = useMemo(() => deriveProgress(project, shownEventId), [project, shownEventId]);
+  const linkedIds = useMemo(() => linkedSignalIds(project), [project]);
   const tasks = useMemo(() => ((project.version?.data as Dict | undefined)?.tasks || []) as Dict[], [project.version]);
   const taskNames = useMemo(() => Object.fromEntries(tasks.map((task) => [text(task.task_id), text(task.name)])), [tasks]);
   const selectedScenario = useMemo(() => run?.scenarios?.find((item) => item.id === selectedScenarioId), [run?.scenarios, selectedScenarioId]);
@@ -647,6 +657,17 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
   const runIsPreview = isPreview(run?.run);
   const runPending = run?.run && !["succeeded", "failed"].includes(text(run.run.status));
   const demoEvents = project.demo_events || [];
+  const risks = project.risks || [];
+  const triageByEvent = Object.fromEntries(events.map((event) => [text(event.id), event.data?.auto_narrow as Dict | undefined]));
+  // What the watch has recorded, and whether a supplier notice already explains it.
+  const feedSignals = events.filter((event) => ["registered_public_source", "public_holiday", "weather_forecast"].includes(text(event.data?.channel, ""))).map((event) => {
+    const owner = Object.entries(project.related_signals || {}).find(([, rows]) => rows.some((row) => row.event_id === event.id && ((row.reason_terms || []) as unknown[]).length));
+    const ownerEvent = owner ? events.find((item) => item.id === owner[0]) : undefined;
+    return { id: text(event.id), title: text(event.data?.title, "외부 신호"), published: text(event.data?.published_at || event.created_at, "").slice(0, 10),
+      source: text(event.data?.source_label, ""), synthetic: event.data?.data_origin === "SYNTHETIC",
+      related: ownerEvent ? `${text(ownerEvent.data?.source_label, "협력사")} 통보와 같은 작업·같은 사유 → 그 통보 카드의 '관련 외부 신호'에 표시` : "",
+      triage: triageLine(event.data?.auto_narrow as Dict | undefined) };
+  });
 
   // ---- Step rail -----------------------------------------------------
   const stepRail = (
@@ -745,7 +766,7 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
       </div> : null}
       {preview && !project.version && importPreviewCard(preview, false)}
       {project.version ? <>
-        {progress.current === 2 && !progress.focusEvent && nextCallout("변경 불러오기", "changes", "기준 일정이 준비되었습니다. 협력사 통보를 불러와 영향을 확인하세요.")}
+        {progress.current === 2 && nextCallout("감시 시작", "watch", "기준 일정이 준비되었습니다. 감시 화면에서 등록 시 위험 브리핑을 확인하고 감시를 시작하세요.")}
         {progress.current > 2 && !nextInThisSection && nextCallout(progress.next.label, progress.next.section, progress.next.detail)}
         <div className="schedule-board">
           <div className="board-meta"><div><span className="eyebrow">{project.version.status === "committed" ? "COMMITTED VERSION" : "BASELINE"}</span><h3>{project.version.status === "committed" ? "확정 버전" : "기준 버전"} {shortId(project.version.id)} · {tasks.length}개 작업</h3><p>기준 시점 {text(projectData.status_as_of, "미설정")} · 완료 {tasks.filter((task) => task.status === "completed").length} · 진행 중 {tasks.filter((task) => task.status === "in_progress").length} · 예정 {tasks.filter((task) => task.status === "planned").length}{visibleTaskNote ? ` · ${visibleTaskNote}` : ""}</p>{selectedScenario && <p className="board-overlay">색이 다른 막대: 선택한 대응안 '{text(selectedScenario.data?.label)}'의 변경 일정</p>}</div></div>
@@ -755,29 +776,77 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
     </section>
   );
 
-  // ---- 3 DETECT --------------------------------------------------------
+  // ---- 3 WATCH ---------------------------------------------------------
+  const isHero = Boolean(projectData.hero_fixture_id);
+  const started = watchStarted(project);
+  const feedEvents = events.filter((event) => isFeedSignal(event));
+  const changeCard = (event: Row) => (
+    <ChangeCard key={text(event.id)} event={event} tasks={tasks} taskNames={taskNames} busy={busy}
+      isFocus={event.id === progress.focusEvent?.id}
+      runs={(project.runs || []).filter((item) => item.kind === "analysis" && item.event_id === event.id)}
+      investigations={(project.runs || []).filter((item) => item.kind === "investigation" && item.event_id === event.id)}
+      relatedSignals={(project.related_signals || {})[text(event.id)] || []} agentEnabled={Boolean(project.agent_enabled)}
+      risks={risks} triageByEvent={triageByEvent}
+      llmMode={text(project.llm_mode, "live")} onResolve={resolveInvestigation}
+      onInvestigate={startInvestigation}
+      onConfirm={confirmEvent} onAnalyze={startAnalysis} onReviewExternal={reviewExternalEvent}
+      onOpenResult={() => go("scenarios")} />
+  );
+  const watchView = (
+    <section className="workspace-view" id="watch" aria-labelledby="watch-title">
+      <div className="view-heading"><div><p className="eyebrow">3 · WATCH</p><h2 id="watch-title">위험 브리핑과 감시</h2><p>등록 시 위험 브리핑을 확인하고 감시를 시작합니다. 워커가 모은 신호는 변화 자동 추리기가 한 번 분류하고, 조사는 사람이 시작합니다.</p></div><span className="view-context">{started ? "감시 중" : "감시 전"}{feedEvents.length ? ` · 신호 ${feedEvents.length}건` : ""}</span></div>
+      {!project.version ? (loaded ? nextCallout("기준 일정 연결", "schedule", "브리핑과 감시에는 기준 일정이 필요합니다.") : null) : <>
+        {progress.current > 2 && nextCallout(progress.next.label, progress.next.section, progress.next.detail)}
+        <BriefingPanel briefing={project.briefing} llmMode={text(project.llm_mode, "live")} />
+        <article className="focus-card watch-start" aria-label="감시 시작">
+          <div className="panel-heading"><div><span className="eyebrow">워커 · 수집</span><h3>{started ? "감시 중" : "감시 시작"}</h3>
+            <p>{isHero
+              ? "데모는 등록 출처(EU 환경총국 뉴스)를 한 번 수집하는 것을 시뮬레이션합니다. 실제 수집은 감시 계획을 활성화하면 워커가 주기적으로 합니다."
+              : "아래 감시 계획의 제안을 수락·제외하고 활성화한 뒤 시작하세요. 워커가 등록 출처·공휴일·기상을 주기적으로 확인합니다."}</p></div>
+            {started && <span className="status-chip ok">시작 {when(projectData.watch_started_at)}</span>}</div>
+          {!started && <button onClick={startWatch} disabled={busy || (!isHero && !project.watch_plan?.enabled)}>{isHero ? "감시 시작 · 데모 수집 시뮬레이션" : "감시 시작"}</button>}
+        </article>
+        <section className="focus-card watch-feed-panel" aria-label="감시 피드">
+          <div className="panel-heading"><div><h3>감시 피드 · 워커 신호 + 변화 자동 추리기</h3><p>새로 들어온 신호마다 자동 추리기가 한 번 관련 있음·확인 필요·무관으로 나눕니다. 조사와 일정 계산은 사람이 시작합니다.</p></div></div>
+          {feedEvents.length ? <div className="focus-event-list">{feedEvents.map((event) => linkedIds.has(text(event.id))
+            ? <div key={text(event.id)} className="feed-merged"><span className="status-chip">협력사 통보에 합쳐짐</span> <b>{text(event.data?.title, "외부 신호")}</b>
+                <small>{feedSignals.find((row) => row.id === event.id)?.related}</small>
+                {triageLine(event.data?.auto_narrow as Dict | undefined) && <small>{triageLine(event.data?.auto_narrow as Dict | undefined)}</small>}
+                <button className="text-button" onClick={() => go("changes")}>변경 화면에서 보기 →</button></div>
+            : changeCard(event))}</div>
+            : <div className="empty focus-empty">{started ? "아직 들어온 신호가 없습니다." : "감시를 시작하면 워커가 모은 신호가 여기에 들어옵니다."}</div>}
+        </section>
+        <RiskRegister risks={risks} busy={busy} onStatus={updateRisk} />
+        <details className="focus-card watch-section">
+          <summary><b>감시 계획 설정</b> · 공휴일·기상·공식 공지 {project.watch_plan?.enabled ? "· 주기 감시 켜짐" : "· 주기 감시 꺼짐"}</summary>
+          <p className="muted">기준 일정에서 제안된 감시 항목을 수락·제외한 뒤 활성화합니다. 협력사 통보와 같은 작업·같은 사유인 신호는 그 통보 카드의 '관련 외부 신호'에 함께 표시됩니다.</p>
+          <ExternalWatch plan={project.watch_plan || {}} tasks={tasks} disabled={busy} onSave={saveExternalWatch} onScan={runScan} />
+        </details>
+        {isHero && <details className="focus-card watch-section">
+          <summary><b>테스트용 공지 수집</b> · 회귀 테스트·평가용 합성 공지</summary>
+          <div className="button-row">{demoEvents.filter((item) => item.channel === "registered_public_source").map((item) => (
+            <button key={text(item.signal_id)} className="secondary" disabled={busy} onClick={() => loadTestNotice(text(item.signal_id))}>{text(item.signal_id)} · {text(item.source_label).replace("합성 외부 공지 · ", "")}</button>))}</div>
+        </details>}
+      </>}
+    </section>
+  );
+
+  // ---- 4 DETECT --------------------------------------------------------
   const intakePrimary = !progress.focusEvent || progress.allDone;
+  const inbox = demoInbox(demoEvents);
+  const importedIds = new Set(events.map((event) => text(event.data?.event_id, "")).filter(Boolean));
   const changesView = (
     <section className="workspace-view" id="changes" aria-labelledby="changes-title">
-      <div className="view-heading"><div><p className="eyebrow">3 · DETECT</p><h2 id="changes-title">변경 감지</h2><p>협력사 통보를 불러와 해석된 작업·날짜를 확인합니다. 확인하면 영향 분석이 바로 시작됩니다.</p></div><span className="view-context">{eventCount}건 기록</span></div>
+      <div className="view-heading"><div><p className="eyebrow">4 · DETECT</p><h2 id="changes-title">변경 감지</h2><p>협력사 통보를 불러와 해석된 작업·날짜를 확인합니다. 확인하면 영향 분석이 바로 시작됩니다.</p></div><span className="view-context">{eventCount}건 기록</span></div>
       {!project.version ? (loaded ? nextCallout("기준 일정 연결", "schedule", "변경을 계산하려면 먼저 기준 일정이 필요합니다.") : null) : <>
-        {progress.current > 3 && nextCallout(progress.next.label, progress.next.section, progress.next.detail)}
+        {progress.next.section !== "changes" && nextCallout(progress.next.label, progress.next.section, progress.next.detail)}
         <div className="changes-layout">
           <div className="change-intake-stack">
             <article className="focus-card">
-              <div className="panel-heading"><div><h3>변경 불러오기</h3><p>{demoEvents.length ? "데모는 합성 통보를 고르거나, 실제 메시지를 붙여 넣으세요." : "협력사 메시지를 붙여 넣으세요. 합성 통보 목록은 hero 데모 기준 일정에서만 제공됩니다."}</p></div></div>
-              {demoEvents.length > 0 && <>
-                <label>합성 통보<select aria-label="합성 통보 선택" value={selectedDemoIndex} onChange={(event) => setSelectedDemoIndex(Number(event.target.value))}>
-                  <option value={-1}>통보를 고르세요</option>
-                  <optgroup label="대표 데모">
-                    {demoEvents.map((item, index) => item.event_id === "X2" ? <option key="lead-X2" value={index}>X2 · 대표 데모 · 협력사 통보에 없던 숨은 위험 찾기 (같은 시기 외부 공지 N-X2도 함께 불러옴)</option> : null)}
-                  </optgroup>
-                  <optgroup label="테스트용">
-                    {demoEvents.map((item, index) => item.event_id === "X2" ? null : <option key={`${text(item.event_id)}-${index}`} value={index}>{text(item.event_id)} · {text(item.source_label)}{demoEvents.slice(0, index).some((earlier) => earlier.event_id === item.event_id) ? " (중복 수신)" : ""}{item.corrects_event_id ? ` (${text(item.corrects_event_id)} 정정)` : ""}</option>)}
-                  </optgroup>
-                </select></label>
-                <button className={intakePrimary ? "" : "secondary"} onClick={createEventFromDemo} disabled={selectedDemoIndex < 0 || busy}>합성 통보 불러오기</button>
-              </>}
+              <div className="panel-heading"><div><h3>받은편지함</h3><p>{inbox.length ? "협력사 통보를 골라 내용을 확인한 뒤 변경으로 등록하세요. 지금은 합성 메일이며, 메일 연결은 같은 목록 구조를 씁니다." : "협력사 메시지를 붙여 넣으세요. 합성 받은편지함은 hero 데모 기준 일정에서만 제공됩니다."}</p></div></div>
+              {inbox.length > 0 && <Inbox messages={inbox} selectedId={selectedMessageId} importedIds={importedIds} busy={busy}
+                hint={started ? "" : "대표 데모는 감시 화면에서 '감시 시작'을 먼저 누르면 같은 시기 외부 공지가 이 통보와 연결됩니다."}
+                onSelect={setSelectedMessageId} onImport={importInboxMessage} />}
               <label>변경 메시지<textarea aria-label="협력사 변경 통보" value={manualMessage} onChange={(event) => setManualMessage(event.target.value)} rows={4} placeholder="예: T045 현장 설비 반입 완료일이 2026-12-05에서 2026-12-28로 변경됩니다." /></label>
               <button className={intakePrimary && !demoEvents.length ? "" : "secondary"} onClick={createManualEvent} disabled={busy || !manualMessage.trim()}>변경 메시지 등록</button>
             </article>
@@ -801,24 +870,10 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
           </div>
           <div className="focus-card event-focus-panel">
             <div className="panel-heading"><div><h3>변경 카드</h3><p>최신 변경이 위에 있습니다. 확인할 해석과 질문을 카드마다 보여줍니다.</p></div></div>
-            {eventCount ? <div className="focus-event-list">{events.map((event) => (
-              <ChangeCard key={text(event.id)} event={event} tasks={tasks} taskNames={taskNames} busy={busy}
-                isFocus={event.id === progress.focusEvent?.id}
-                runs={(project.runs || []).filter((item) => item.kind === "analysis" && item.event_id === event.id)}
-                investigations={(project.runs || []).filter((item) => item.kind === "investigation" && item.event_id === event.id)}
-                relatedSignals={(project.related_signals || {})[text(event.id)] || []} agentEnabled={Boolean(project.agent_enabled)}
-                llmMode={text(project.llm_mode, "live")} onResolve={resolveInvestigation}
-                onInvestigate={startInvestigation}
-                onConfirm={confirmEvent} onAnalyze={startAnalysis} onReviewExternal={reviewExternalEvent}
-                onOpenResult={() => go("scenarios")} />
-            ))}</div> : <div className="empty focus-empty">아직 변경이 없습니다. 왼쪽에서 통보를 불러오세요.</div>}
+            {events.some((event) => !isFeedSignal(event)) ? <div className="focus-event-list">{events.filter((event) => !isFeedSignal(event) && !linkedIds.has(text(event.id))).map(changeCard)}</div>
+              : <div className="empty focus-empty">아직 변경이 없습니다. 왼쪽 받은편지함에서 통보를 불러오세요.</div>}
           </div>
         </div>
-        <details className="focus-card watch-section">
-          <summary><b>외부 변화 감시 (선택)</b> · 공휴일·기상·공식 공지 감시 계획 {project.watch_plan?.enabled ? "· 감시 중" : "· 꺼짐"}</summary>
-          <p className="muted">기준 일정에서 제안된 감시 항목을 수락·제외한 뒤 활성화합니다. 새로 감지된 근거는 위의 변경 카드로 들어옵니다.</p>
-          <ExternalWatch plan={project.watch_plan || {}} tasks={tasks} disabled={busy} onSave={saveExternalWatch} onScan={runScan} />
-        </details>
       </>}
     </section>
   );
@@ -847,7 +902,7 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
     else step = <div className="panel-note"><p>{allAccepted ? "필요한 조건을 모두 확인했습니다." : `확인할 조건 ${required.filter((condition) => !accepted.has(condition)).length}건이 남았습니다.`}</p><button onClick={() => approveScenario(selectedScenario)} disabled={busy || !allAccepted}>이 대응안 승인</button></div>;
     return (
       <div className="focus-card approval-focus" id="approval">
-        <div className="panel-heading"><div><span className="eyebrow">5 · APPROVE</span><h3>{text(data.label)}</h3><p>{scenarioScore(data)} · 완료 예정 {text(data.finish_date)} · 무대응 대비 회복 {text(data.recovery_days_vs_no_response, "-")}일 · 추가 비용 {costLabel(data)}</p></div></div>
+        <div className="panel-heading"><div><span className="eyebrow">6 · APPROVE</span><h3>{text(data.label)}</h3><p>{scenarioScore(data)} · 완료 예정 {text(data.finish_date)} · 무대응 대비 회복 {text(data.recovery_days_vs_no_response, "-")}일 · 추가 비용 {costLabel(data)}</p></div></div>
         {required.length > 0 && <ul className="condition-list">{required.map((condition) => <li key={condition} className={accepted.has(condition) ? "ok" : ""}>{accepted.has(condition) ? "확인됨 · " : "확인 필요 · "}{condition}</li>)}</ul>}
         {!runIsPreview && actions.map((action) => (
           <div key={text(action.id)} className="condition-review">
@@ -882,14 +937,14 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
 
   const scenariosView = (
     <section className="workspace-view" id="scenarios" aria-labelledby="scenarios-title">
-      <div className="view-heading"><div><p className="eyebrow">4 · COMPARE → 5 · APPROVE</p><h2 id="scenarios-title">대응안 비교와 승인</h2><p>일정·비용·조건을 같은 기준으로 비교하고, 조건을 확인한 안을 승인합니다.</p></div><span className="view-context">{run?.run ? runLabel(run.run) : "분석 대기"}</span></div>
-      {!run?.run ? nextCallout(progress.next.label, progress.next.section, progress.current <= 3 ? progress.next.detail : "변경을 확인하면 영향 분석이 시작되고 결과가 여기에 표시됩니다.") : <>
+      <div className="view-heading"><div><p className="eyebrow">5 · COMPARE → 6 · APPROVE</p><h2 id="scenarios-title">대응안 비교와 승인</h2><p>일정·비용·조건을 같은 기준으로 비교하고, 조건을 확인한 안을 승인합니다.</p></div><span className="view-context">{run?.run ? runLabel(run.run) : "분석 대기"}</span></div>
+      {!run?.run ? nextCallout(progress.next.label, progress.next.section, progress.current <= 4 ? progress.next.detail : "변경을 확인하면 영향 분석이 시작되고 결과가 여기에 표시됩니다.") : <>
         {viewRunId && <div className="run-pin"><span>이력에서 고른 실행 {shortId(viewRunId)}을 보고 있습니다.</span><button className="text-button" onClick={() => { setViewRunId(""); viewRunRef.current = ""; void refresh(); }}>최신 결과로</button></div>}
         {runPending ? <div className="analysis-receipt pending" role="status"><span className="eyebrow">영향 분석</span><h3>영향을 계산하고 있습니다…</h3><p>끝나면 이 화면에 결과가 자동으로 표시됩니다.</p></div> : <div className="analysis-receipt">
           <span className="eyebrow">{runIsPreview ? "잠정 결과" : recalculated ? "조사 결과 반영 · 다시 계산" : "영향 분석 결과"}</span>
           <h3>{receiptHeadline}</h3>
           <p>{runLabel(run.run)} · {text(runEvent?.data?.title || runEvent?.data?.content, "변경").slice(0, 80)}</p>
-          {!run.scenarios?.length && run.run.status === "succeeded" && <button onClick={() => go("changes", `review-${text(run.run?.event_id)}`)}>변경 화면에서 작업·날짜 지정 →</button>}
+          {!run.scenarios?.length && run.run.status === "succeeded" && <button onClick={() => go(isFeedSignal(runEvent) ? "watch" : "changes", `review-${text(run.run?.event_id)}`)}>{isFeedSignal(runEvent) ? "감시 화면에서 작업·날짜 지정 →" : "변경 화면에서 작업·날짜 지정 →"}</button>}
         </div>}
         {!runPending && !runIsPreview && runEvent && (runSignals.length > 0 || runInvestigations.length > 0) && <InvestigationPanel variant="full" external={Boolean(runEvent.data?.evidence)}
           inactive={false} signals={runSignals} content={text(runEvent.data?.content, "")} llmMode={text(project.llm_mode, "live")}
@@ -921,8 +976,8 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
   const executeActions = approvedScenarioId ? scenarioActions(approvedScenarioId) : [];
   const executeView = (
     <section className="workspace-view" id="execute" aria-labelledby="execute-title">
-      <div className="view-heading"><div><p className="eyebrow">6 · EXECUTE</p><h2 id="execute-title">일정 반영·실행</h2><p>승인한 대응안을 새 일정 버전으로 확정하고 Excel로 내보냅니다.</p></div><span className="view-context">{committed ? "새 버전 확정됨" : progress.approval ? "확정 대기" : "승인 대기"}</span></div>
-      {!progress.approval ? nextCallout(progress.next.label, progress.next.section, progress.current < 4 ? progress.next.detail : "대응안을 승인하면 여기서 새 일정 버전을 확정할 수 있습니다.") : committed ? (
+      <div className="view-heading"><div><p className="eyebrow">7 · EXECUTE</p><h2 id="execute-title">일정 반영·실행</h2><p>승인한 대응안을 새 일정 버전으로 확정하고 Excel로 내보냅니다.</p></div><span className="view-context">{committed ? "새 버전 확정됨" : progress.approval ? "확정 대기" : "승인 대기"}</span></div>
+      {!progress.approval ? nextCallout(progress.next.label, progress.next.section, progress.current < 5 ? progress.next.detail : "대응안을 승인하면 여기서 새 일정 버전을 확정할 수 있습니다.") : committed ? (
         <div className="execute-card done">
           <div><span className="eyebrow">새 일정 버전</span><h3>확정 버전 {shortId(committed.id)} · {when(committed.created_at)}</h3><p>반영한 대응안: {text(approvedScenario?.data?.label, shortId(approvedScenarioId))}{approvedScenario ? ` · 완료 예정 ${text(approvedScenario.data?.finish_date)} · 추가 비용 ${costLabel(approvedScenario.data || {})}` : ""}</p><p className="muted">Excel에는 기준 일정과 변경 일정, 종료 차이가 함께 들어갑니다.</p></div>
           <div className="execute-actions"><button onClick={downloadExport} disabled={busy}>Excel 다운로드</button><button className="secondary" onClick={() => go("schedule")}>일정에서 보기</button><button className="text-button" onClick={() => go("changes")}>새 변경 불러오기</button></div>
@@ -1048,6 +1103,7 @@ export default function Home({ initialProjectId = "" }: { initialProjectId?: str
 
       {activeSection === "overview" && overviewView}
       {activeSection === "schedule" && scheduleView}
+      {activeSection === "watch" && watchView}
       {activeSection === "changes" && changesView}
       {activeSection === "scenarios" && scenariosView}
       {activeSection === "execute" && executeView}
@@ -1060,8 +1116,9 @@ function firstIsoDate(value: string) {
   return /(20\d{2}-\d{2}-\d{2})/.exec(value)?.[1] || "";
 }
 
-function ChangeCard({ event, tasks, taskNames, busy, isFocus, runs, investigations, relatedSignals, agentEnabled, llmMode, onInvestigate, onResolve, onConfirm, onAnalyze, onReviewExternal, onOpenResult }: {
-  event: Row; tasks: Dict[]; taskNames: Record<string, string>; busy: boolean; isFocus: boolean; runs: Row[]; investigations: Row[]; relatedSignals: Dict[]; agentEnabled: boolean; llmMode: string; onInvestigate: (eventId: string) => void;
+function ChangeCard({ event, tasks, taskNames, busy, isFocus, runs, investigations, relatedSignals, agentEnabled, llmMode, risks, triageByEvent, onInvestigate, onResolve, onConfirm, onAnalyze, onReviewExternal, onOpenResult }: {
+  event: Row; tasks: Dict[]; taskNames: Record<string, string>; busy: boolean; isFocus: boolean; runs: Row[]; investigations: Row[]; relatedSignals: Dict[]; agentEnabled: boolean; llmMode: string;
+  risks: Dict[]; triageByEvent: Record<string, Dict | undefined>; onInvestigate: (eventId: string, include?: string[]) => void;
   onResolve: (runId: string, decision: "applies" | "not_applicable", note: string) => Promise<void>;
   onConfirm: (eventId: string, payload?: Dict) => Promise<void>; onAnalyze: (eventId: string) => Promise<void>;
   onReviewExternal: (eventId: string, payload: Dict) => Promise<void>; onOpenResult: () => void;
@@ -1074,6 +1131,7 @@ function ChangeCard({ event, tasks, taskNames, busy, isFocus, runs, investigatio
   const facts = (Array.isArray(data.extracted_facts) ? data.extracted_facts : []) as Dict[];
   const [ids, setIds] = useState<string[]>(((data.related_task_ids || []) as string[]).slice(0, 3));
   const [kind, setKind] = useState("estimated_finish");
+  const [picked, setPicked] = useState<string[]>([]);
   const [day, setDay] = useState(firstIsoDate(text(data.content, "")));
   const suggested = ((data.related_task_ids || []) as string[]).join(",");
   // LLM interpretation may add task candidates after the card first renders.
@@ -1097,12 +1155,15 @@ function ChangeCard({ event, tasks, taskNames, busy, isFocus, runs, investigatio
       {Array.isArray(data.verification_required) && data.verification_required.length > 0 && <p className="event-question">추가 확인: {(data.verification_required as string[]).join(" · ")}</p>}
       {Array.isArray(data.missing_fields) && data.missing_fields.length > 0 && !confirmed && <p className="event-question">확인 질문: {(data.missing_fields as string[]).join(" · ")}</p>}
       {candidates.length > 0 && <div className="event-interpretation"><b>에이전트가 찾은 작업 후보</b><ul>{candidates.map((candidate, index) => <li key={`${text(candidate.task_id)}-${index}`}><span>{text(candidate.task_id)}</span> {taskNames[text(candidate.task_id)] || ""}{candidate.quote ? <q>{text(candidate.quote)}</q> : null}{candidate.reason ? <small> {text(candidate.reason)}</small> : null}</li>)}</ul></div>}
-      {Array.isArray(data.risk_signal_evidence) && data.risk_signal_evidence.length > 0 && <details className="event-evidence"><summary>유사 위험 실제 사례 {(data.risk_signal_evidence as Dict[]).length}건 · 지연 일수는 계산에 쓰지 않음</summary>{(data.risk_signal_evidence as Dict[]).map((caseRow) => <p key={text(caseRow.risk_id)}><a href={text(caseRow.source_url)} target="_blank" rel="noreferrer">{text(caseRow.title)}</a><small>발행 {text(caseRow.published_date)} · {text(caseRow.country)} · {text(caseRow.risk_type)}{caseRow.temporal_status === "POST_AS_OF_REFERENCE" ? " · 통보 이후 발행: 후향적 참고만 가능" : ""}</small></p>)}</details>}
+      {!data.evidence && <RelatedSignals signals={relatedSignals} cases={(Array.isArray(data.risk_signal_evidence) ? data.risk_signal_evidence : []) as Dict[]} triageByEvent={triageByEvent} />}
+      {Boolean(data.evidence) && <TriagePanel triage={data.auto_narrow as Dict | undefined} taskNames={taskNames} risks={risks}
+        picked={picked} onPick={investigations.length ? undefined : setPicked} />}
 
       <InvestigationPanel variant={data.evidence ? "full" : "card"} external={Boolean(data.evidence)} inactive={inactive}
+        startAllowed={triageAllowsInvestigation(data.auto_narrow as Dict | undefined)}
         signals={relatedSignals} content={text(data.content, "")} llmMode={llmMode} resolution={(data.investigation as Dict | undefined)?.resolution as Dict | undefined}
-        runs={investigations} agentEnabled={agentEnabled} busy={busy} startPrimary={false} onStart={() => onInvestigate(eventId)}
-        onResolve={onResolve} onOpen={analysed ? onOpenResult : undefined} />
+        runs={investigations} agentEnabled={agentEnabled} busy={busy} startPrimary={false} onStart={() => onInvestigate(eventId, picked)}
+        onResolve={onResolve} />
 
       {data.evidence ? <EvidenceReview event={data} tasks={tasks} disabled={busy} onReview={(payload) => onReviewExternal(eventId, payload)} onAnalyze={() => onAnalyze(eventId)} />
         : inactive ? <p className="muted">{status === "SUPERSEDED" ? "정정 통보로 대체되어 계산하지 않습니다." : "보류된 변경입니다."}</p>
@@ -1159,7 +1220,7 @@ function checkResult(entry: Dict) {
     case "narrow_candidates":
       return `후보 ${rows("candidates").length}개: ${rows("candidates").map((row) => text(row.task_id)).join(", ")}`;
     case "search_risk_signals":
-      return `유사 사례 ${rows("results").length}건`;
+      return `${text(result.label, "유사 사례")} ${rows("results").length}건: ${rows("results").map((row) => text(row.risk_id)).join(", ") || "없음"}`;
     case "compare_responses":
       return `대응안 ${rows("scenarios").length}개 계산`;
     default:
@@ -1193,6 +1254,48 @@ function usageLine(usage: Dict | undefined, llmMode: string) {
   return `LLM 호출 ${calls}회 · ${tokens} · ${llmMode === "replay" ? `녹화 당시 비용 ${cost} (재생이라 이번 실행 비용 0)` : `비용 ${cost}`}`;
 }
 
+/** External notices tied to this supplier notice plus stored real cases of the same risk type. */
+function triageAllowsInvestigation(triage?: Dict) {
+  if (!triage) return true;
+  if (triage.status === "no_candidates") return false;
+  if (triage.status !== "interpreted") return true;  // only the rules ran: a person may still investigate
+  return ((triage.related || []) as unknown[]).length + ((triage.needs_check || []) as unknown[]).length > 0;
+}
+
+function triageLine(triage?: Dict) {
+  if (!triage) return "";
+  if (triage.status === "interpreted") {
+    const ids = (key: string) => ((triage[key] || []) as Dict[]).map((row) => text(row.task_id)).join("·");
+    return `자동 추리기: 관련 있음 ${ids("related") || "0건"} · 확인 필요 ${ids("needs_check") || "0건"} · 무관 ${((triage.unrelated || []) as unknown[]).length}건 제외`;
+  }
+  return text(triage.summary, "");
+}
+
+function RelatedSignals({ signals, cases, triageByEvent = {} }: { signals: Dict[]; cases: Dict[]; triageByEvent?: Record<string, Dict | undefined> }) {
+  const linked = signals.filter((row) => ((row.reason_terms || []) as unknown[]).length > 0);
+  if (!linked.length && !cases.length) return null;
+  const basis = new Set(linked.map((row) => text(row.basis_risk_id, "")).filter(Boolean));
+  const link = (url: unknown, title: unknown) => text(url, "") ? <a href={text(url)} target="_blank" rel="noreferrer">{text(title)}</a> : <b>{text(title)}</b>;
+  return <section className="related-signals" aria-label="관련 외부 신호">
+    <div className="related-head"><b>관련 외부 신호 {linked.length + cases.length}건</b><small>기사 속 지연 일수는 계산에 쓰지 않음</small></div>
+    <ul>
+      {linked.map((row) => <li key={text(row.event_id)}>
+        <span className="signal-kind feed">감시 피드에서 들어온 신호 · 관련 있음</span>
+        {link(row.source_url, row.title)}
+        <small>{text(row.source_host, "등록 출처")}{row.data_origin === "SYNTHETIC" ? " · 합성 공지" : ""} · 발행 {text(row.published_at).slice(0, 10)}</small>
+        <small className="why">왜 관련: 같은 작업 {((row.overlapping_task_ids || []) as string[]).join(", ")} · 통보 사유와 같은 {((row.reason_terms || []) as string[]).map((term) => `‘${term}’`).join("·")} · 통보와 {text(row.days_apart)}일 차이</small>
+        {triageLine(triageByEvent[text(row.event_id)]) && <small className="why">{triageLine(triageByEvent[text(row.event_id)])}</small>}
+      </li>)}
+      {cases.map((row) => <li key={text(row.risk_id)}>
+        <span className="signal-kind">유사 위험 실제 사례</span>
+        {link(row.source_url, row.title)}
+        <small>{text(row.source_name, "출처")} · 발행 {text(row.published_date)}{row.temporal_status === "POST_AS_OF_REFERENCE" ? " · 통보 이후 발행: 후향적 참고만" : ""}</small>
+        <small className="why">왜 관련: {basis.has(text(row.risk_id)) ? "위 외부 공지가 근거로 삼은 실제 사례" : text(row.why, "같은 위험 유형의 실제 사례")}</small>
+      </li>)}
+    </ul>
+  </section>;
+}
+
 function CaseLink({ row }: { row: Dict }) {
   return <><a href={text(row.source_url)} target="_blank" rel="noreferrer">{text(row.title)}</a> ({text(row.source_name, "출처")}, 발행 {text(row.published_date)})</>;
 }
@@ -1212,13 +1315,13 @@ function ResolveBox({ question, ids, canApply, busy, onResolve }: {
   </div>;
 }
 
-function InvestigationPanel({ variant, external, inactive, signals, runs, agentEnabled, busy, onStart, onResolve, onOpen, content, llmMode, resolution, startPrimary }: {
+function InvestigationPanel({ variant, external, inactive, signals, runs, agentEnabled, busy, onStart, onResolve, content, llmMode, resolution, startPrimary, startAllowed = true }: {
   variant: "full" | "card"; external: boolean; inactive: boolean; signals: Dict[]; runs: Row[]; agentEnabled: boolean; busy: boolean;
   onStart: () => void; onResolve: (runId: string, decision: "applies" | "not_applicable", note: string) => Promise<void>;
-  onOpen?: () => void; content: string; llmMode: string; resolution?: Dict; startPrimary: boolean;
+  content: string; llmMode: string; resolution?: Dict; startPrimary: boolean; startAllowed?: boolean;
 }) {
   const latest = runs.slice().sort((a, b) => text(b.created_at, "").localeCompare(text(a.created_at, "")))[0];
-  if ((!external && !signals.length && !latest) || (inactive && !latest)) return null;
+  if ((!external && !signals.length && !latest) || (inactive && !latest) || (external && !startAllowed && !latest)) return null;
   const running = latest && !["succeeded", "failed"].includes(text(latest.status));
   const done = latest?.status === "succeeded";
   const data = (latest?.data || {}) as Dict;
@@ -1236,6 +1339,7 @@ function InvestigationPanel({ variant, external, inactive, signals, runs, agentE
   const worst = results("simulate_conditional").filter((row) => row.status !== "rejected").pop();
   const factQuotes = log.flatMap((entry) => ((((entry.args || {}) as Dict).changes || []) as Dict[]).map((change) => change.fact_quote));
   const candidateQuotes = results("narrow_candidates").flatMap((row) => ((row.candidates || []) as Dict[]).map((item) => item.quote));
+  const riskLink = data.risk_link as Dict | undefined;
   const foundItems = results("find_procurement_items").flatMap((row) => (row.items || []) as Dict[]);
   const absorbed = new Set(results("check_schedule_slack").flatMap((row) => ((row.tasks || []) as Dict[]).filter((task) => task.absorbs_bound).map((task) => text(task.task_id))));
   const atRisk = ((worst?.changes || []) as Dict[]);
@@ -1263,12 +1367,12 @@ function InvestigationPanel({ variant, external, inactive, signals, runs, agentE
   const open = done && (stop === "M3" || stop === "M4") && !resolution;
 
   if (variant === "card") {
+    if (!latest) return null;
     return <div className="investigation compact" aria-label="에이전트 숨은 위험 조사">
       <b>에이전트 숨은 위험 조사</b>
-      {!latest ? <p>{signalsText}. 영향 분석 뒤 대응안 화면에서 조사할 수 있습니다.</p>
-        : running ? <p className="muted">조사 중입니다…</p>
+      {running ? <p className="muted">조사 중입니다…</p>
         : <p>{resolutionText || conclusion}</p>}
-      {latest && onOpen && <button className="text-button" onClick={onOpen}>대응안 화면에서 보기 →</button>}
+      {done && <RiskLinkNote link={riskLink} compact />}
     </div>;
   }
   const reasoning = log.length > 0 && <ol className="investigation-checks">{log.map((entry, index) => <li key={index}>
@@ -1281,11 +1385,12 @@ function InvestigationPanel({ variant, external, inactive, signals, runs, agentE
     {!latest && signalsText && <p>{signalsText}</p>}
     {!latest && (!agentEnabled
       ? <p className="muted">에이전트가 꺼져 있어 조사할 수 없습니다. 대표 데모는 저장소 폴더에서 <code>scripts\demo.cmd</code>로 실행하세요(녹화본 재생, 비용 0).</p>
-      : !inactive && <button className={startPrimary ? "" : "secondary"} onClick={onStart} disabled={busy}>에이전트로 숨은 위험 조사</button>)}
+      : !inactive && <button className={startPrimary ? "" : "secondary"} onClick={onStart} disabled={busy}>{external ? "에이전트로 조사" : "에이전트로 숨은 위험 조사"}</button>)}
     {running && <p className="muted">조사 중입니다… 끝나면 여기에 결과가 표시됩니다.</p>}
     {latest?.status === "failed" && <p className="event-question">조사가 실패했습니다. 이력에서 실행 기록을 확인하세요.</p>}
     {done && <div className="investigation-result">
       <p className="conclusion"><span className={`status-chip${!resolution && (stop === "M3" || stop === "M4") ? " confirm" : ""}`}>{resolution ? "확인 완료" : STOP_LABEL[stop] || "조사 완료"}</span> <b>{conclusion}</b></p>
+      <RiskLinkNote link={riskLink} />
       {(rules.finish_date !== undefined || worst) && <div className="compare-pair" aria-label="통보 내용만 반영과 에이전트 조사 후 비교">
         <div><span className="eyebrow">통보 내용만 반영</span><b>{reportedHeadline}</b><small>{text(rules.scope, "")}</small></div>
         <div className="agent-side"><span className="eyebrow">에이전트 조사 후</span><b>{agentHeadline}</b><small>{agentDetail || text(data.summary, "")}</small></div>

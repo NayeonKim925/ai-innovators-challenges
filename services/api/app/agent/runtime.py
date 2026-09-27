@@ -70,25 +70,32 @@ def run_agent(
             )
 
         usage = _merge_usage(usage, {**(reply.usage or {}), "llm_calls": 1})
-        action = _next_action(reply)
-        if action:
-            name = str(action.get("tool") or "")
-            if name in SCHEDULE_TOOLS and not event.get("patch"):
-                reason = "changed task and date require confirmation before schedule calculation"
-                tool_log.append({"tool": name, "args": action.get("args", {}),
-                                 "status": "blocked_ambiguous", "error": reason})
-                return _result(status="needs_input", summary="Schedule calculation requires confirmed inputs.",
-                               unresolved_items=[reason], tool_log=tool_log, usage=usage)
-            outcome = _execute_action(action, allowed_tools, seen_calls, tool_log, max_calls, context)
-            if outcome:
-                if (outcome["status"] == "invalid_tool_args"
-                        and invalid_arg_retries < MAX_INVALID_ARG_RETRIES
-                        and len(tool_log) < max_calls and step + 1 < max_steps):
+        actions = _next_actions(reply)
+        if actions:
+            # Independent checks the model asks for in one turn run in that turn, in the order given.
+            answered: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            stop: Optional[Dict[str, Any]] = None
+            for action in actions:
+                name = str(action.get("tool") or "")
+                if name in SCHEDULE_TOOLS and not event.get("patch"):
+                    reason = "changed task and date require confirmation before schedule calculation"
+                    tool_log.append({"tool": name, "args": action.get("args", {}),
+                                     "status": "blocked_ambiguous", "error": reason})
+                    return _result(status="needs_input", summary="Schedule calculation requires confirmed inputs.",
+                                   unresolved_items=[reason], tool_log=tool_log, usage=usage)
+                outcome = _execute_action(action, allowed_tools, seen_calls, tool_log, max_calls, context)
+                if outcome and not (outcome["status"] == "invalid_tool_args"
+                                    and invalid_arg_retries < MAX_INVALID_ARG_RETRIES
+                                    and len(tool_log) < max_calls and step + 1 < max_steps):
+                    stop = outcome
+                    break
+                answered.append((action, tool_log[-1]))
+                if outcome:
                     invalid_arg_retries += 1
-                    messages.extend(_tool_result_messages(action, tool_log[-1]))
-                    continue
-                return _result(tool_log=tool_log, usage=usage, **outcome)
-            messages.extend(_tool_result_messages(action, tool_log[-1]))
+                    break
+            if stop:
+                return _result(tool_log=tool_log, usage=usage, **stop)
+            messages.extend(_tool_result_messages(answered))
             continue
 
         final = _parse_final(reply.content)
@@ -224,44 +231,45 @@ def _json_type(annotation: Any) -> str:
     return "string"
 
 
-def _next_action(reply: ChatResult) -> Optional[Dict[str, Any]]:
+def _next_actions(reply: ChatResult) -> List[Dict[str, Any]]:
     if reply.tool_calls:
-        call = reply.tool_calls[0]
-        return {
-            "tool": call.get("name"),
-            "args": call.get("arguments", {}),
-            "tool_call_id": call.get("id"),
-        }
+        return [{"tool": call.get("name"), "args": call.get("arguments", {}), "tool_call_id": call.get("id")}
+                for call in reply.tool_calls]
     try:
         payload = json.loads(reply.content or "{}")
     except json.JSONDecodeError:
-        return None
+        return []
+    if not isinstance(payload, dict):
+        return []
     if payload.get("action") == "tool":
-        return {"tool": payload.get("tool"), "args": payload.get("args", {})}
+        return [{"tool": payload.get("tool"), "args": payload.get("args", {})}]
     tool_call = payload.get("tool_call")
     if isinstance(tool_call, dict):
-        return {"tool": tool_call.get("name") or tool_call.get("tool"), "args": tool_call.get("args", {})}
-    return None
+        return [{"tool": tool_call.get("name") or tool_call.get("tool"), "args": tool_call.get("args", {})}]
+    return []
 
 
-def _tool_result_messages(action: Dict[str, Any], result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    tool_call_id = action.get("tool_call_id")
-    if tool_call_id:
+def _tool_result_messages(answered: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """One assistant turn with every native call it made, then one tool message per call."""
+    native = [(action, result) for action, result in answered if action.get("tool_call_id")]
+    if native and len(native) == len(answered):
         return [
             {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
                     {
-                        "id": tool_call_id,
+                        "id": action["tool_call_id"],
                         "type": "function",
                         "function": {"name": action["tool"], "arguments": _encode(action.get("args"))},
                     }
+                    for action, _ in native
                 ],
             },
-            {"role": "tool", "tool_call_id": tool_call_id, "content": _encode(model_view(result))},
+            *[{"role": "tool", "tool_call_id": action["tool_call_id"], "content": _encode(model_view(result))}
+              for action, result in native],
         ]
-    return [{"role": "user", "content": "Tool result: %s" % _encode(model_view(result))}]
+    return [{"role": "user", "content": "Tool result: %s" % _encode(model_view(result))} for _, result in answered]
 
 
 MODEL_VIEW_DROP = {"schedule", "supplier_schedule", "combined_patch", "external_source_hashes", "scenario_hash"}
@@ -424,6 +432,7 @@ def _normalize_result(value: Dict[str, Any]) -> Dict[str, Any]:
         "tool_log": _list(value.get("tool_log")),
         "status": _normalize_status(value.get("status")),
         "investigation": _investigation(value.get("investigation")),
+        "briefing": value.get("briefing") if isinstance(value.get("briefing"), dict) else None,
         "usage": dict(value.get("usage") or {}),
     }
 
@@ -434,6 +443,7 @@ def _investigation(value: Any) -> Optional[Dict[str, Any]]:
         return None
     stop = str(value.get("stop") or "").strip()
     link = value.get("cause_link") if isinstance(value.get("cause_link"), dict) else None
+    risk = value.get("risk_link") if isinstance(value.get("risk_link"), dict) else None
     return {
         "stop": stop if stop in INVESTIGATION_STOPS else "M5",
         "cause_link": {key: _text(link.get(key)) for key in ("signal_event_id", "supplier_quote", "signal_quote")} if link else None,
@@ -442,6 +452,8 @@ def _investigation(value: Any) -> Optional[Dict[str, Any]]:
         "excluded": [item for item in _list(value.get("excluded")) if isinstance(item, dict)][:20],
         "question": _text(value.get("question"))[:300],
         "checks": [_text(item) for item in _list(value.get("checks")) if _text(item)][:10],
+        "risk_link": ({key: _text(risk.get(key)) for key in ("risk_id", "reason")}
+                      if risk and risk.get("risk_id") else None),
     }
 
 
@@ -547,7 +559,8 @@ _LIST_MARKER = re.compile(r"(?:^|(?<=\s)|(?<=\())\d{1,2}(?=[.)]\s|\))", re.MULTI
 def _calculated_context(context: Dict[str, Any]) -> List[Any]:
     """Calculator output and registered option data the caller put in context."""
     return [context[key] for key in ("scenario_summaries", "changed_tasks_without_response", "response_options",
-                                     "baseline_finish", "related_tasks", "facts", "reported_change")
+                                     "baseline_finish", "related_tasks", "facts", "reported_change",
+                                     "briefing_candidates")
             if context.get(key) is not None]
 
 
@@ -590,7 +603,7 @@ def _ground_final(value: Dict[str, Any], event: Dict[str, Any], tool_log: List[D
             return {key: clean(child) for key, child in item.items()}
         return item
 
-    for key in ("email_draft", "option_explanations", "investigation"):
+    for key in ("email_draft", "option_explanations", "investigation", "briefing"):
         if key in value:
             value[key] = clean(value[key])
 
