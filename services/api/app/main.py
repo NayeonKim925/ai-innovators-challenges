@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .adapters.llm import agent_enabled, llm_mode
 from .events import normalize_event
+from .risk_register import list_risks
 from .storage import Store, digest, identifier, utcnow
 
 
@@ -246,6 +247,15 @@ class AnalysisInput(BaseModel):
 
 class ResolveInput(BaseModel):
     decision: str = Field(pattern="^(applies|not_applicable)$")
+    note: str = Field(default="", max_length=500)
+
+
+class InvestigationInput(BaseModel):
+    include_task_ids: list[str] = Field(default_factory=list, max_length=40)
+
+
+class RiskStatusInput(BaseModel):
+    status: str = Field(pattern="^(EXPECTED|SIGNAL_DETECTED|OCCURRED|RESPONDING|CLOSED)$")
     note: str = Field(default="", max_length=500)
 
 
@@ -606,9 +616,27 @@ def get_project(project_id: str) -> dict[str, Any]:
         "llm_mode": llm_mode(),
         # Supplier notices with a same-period external change on the same tasks can be investigated.
         "related_signals": _related_signals_by_event(db, project_id, version),
+        "risks": list_risks(db, project_id),
+        "briefing": _latest_briefing(db, project_id, version),
         "versions": [dict(row) for row in version_rows],
         "approvals": [dict(row) for row in approval_rows],
     }
+
+
+def _latest_briefing(db: Store, project_id: str, version: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The newest briefing run of the current baseline, queued, running or done."""
+    if not version:
+        return None
+    with db.connection() as conn:
+        row = conn.execute(
+            "SELECT id, status, data, updated_at FROM runs WHERE project_id=? AND kind IN ('baseline_briefing', "
+            "'watch_plan_enrich') AND version_id=? ORDER BY created_at DESC LIMIT 1", (project_id, version["id"]),
+        ).fetchone()
+    if not row:
+        return None
+    data = json.loads(row["data"])
+    return {"run_id": row["id"], "run_status": row["status"], "updated_at": row["updated_at"],
+            "briefing": data.get("briefing"), "agent": data.get("agent"), "summary": data.get("summary")}
 
 
 def _related_signals_by_event(db: Store, project_id: str, version: dict[str, Any] | None) -> dict[str, Any]:
@@ -796,9 +824,8 @@ def confirm_import(project_id: str, import_id: str, value: ConfirmInput) -> dict
     db.put_json("projects", project_id, profile)
     suggestion = suggest_watch_plan(profile, tasks)
     db.put_json("watch_plans", project_id, suggestion)
-    if suggestion["proposal_items"] and agent_enabled():
-        db.create_run(project_id, "watch_plan_enrich", None, version_id,
-                      f"watch-plan-enrich:{version_id}", {})
+    # The worker briefs the baseline's top risks (rules always, the agent when on) and enriches the watch plan.
+    db.create_run(project_id, "baseline_briefing", None, version_id, f"baseline-briefing:{version_id}", {})
     return {"version_id": version_id, "version_hash": digest(snapshot), "task_count": len(tasks), "watch_plan_suggestion": suggestion}
 
 
@@ -923,8 +950,11 @@ def create_event(project_id: str, value: EventInput) -> dict[str, Any]:
 
 
 @app.post("/api/projects/{project_id}/events/{event_id}/investigations", status_code=202, dependencies=[Depends(authorize)])
-def start_investigation(project_id: str, event_id: str) -> dict[str, Any]:
-    """A person starts an investigation; nothing starts one automatically."""
+def start_investigation(project_id: str, event_id: str, value: InvestigationInput | None = None) -> dict[str, Any]:
+    """A person starts an investigation; nothing starts one automatically.
+
+    A triaged notice is investigated on its related tasks; a person may add needs-check tasks by ID.
+    """
     from .investigation import EXTERNAL_CHANNELS, related_signals
 
     db = store()
@@ -943,11 +973,29 @@ def start_investigation(project_id: str, event_id: str) -> dict[str, Any]:
             raise HTTPException(409, "같은 기간·같은 작업의 외부 변화가 없어 조사할 것이 없습니다")
     elif event.get("channel") not in EXTERNAL_CHANNELS:
         raise HTTPException(409, "외부 변화 또는 협력사 통보만 조사할 수 있습니다")
+    include = sorted(set((value or InvestigationInput()).include_task_ids))
+    if include:
+        needs_check = {str(row.get("task_id")) for row in (event.get("auto_narrow") or {}).get("needs_check") or []}
+        if not set(include) <= needs_check:
+            raise HTTPException(422, "자동 추리기의 '확인 필요' 작업만 추가로 고를 수 있습니다")
     key = digest({"investigation": event_id, "event_hash": digest(event.get("patch") or event.get("content")),
-                  "version_id": version["id"]})
+                  "version_id": version["id"], **({"include": include} if include else {})})
     run = db.create_run(project_id, "investigation", event_id, version["id"], key,
-                        {"project_context_snapshot": db.project_context_snapshot(project_id)})
+                        {"project_context_snapshot": db.project_context_snapshot(project_id), "include_task_ids": include})
     return {"run_id": run["id"], "status": run["status"]}
+
+
+@app.patch("/api/projects/{project_id}/risks/{risk_id}", dependencies=[Depends(authorize)])
+def update_risk(project_id: str, risk_id: str, value: RiskStatusInput) -> dict[str, Any]:
+    """A person sets a register risk's status, forward or back, with a note kept in its history."""
+    from .risk_register import set_status
+
+    db = store()
+    project_or_404(db, project_id)
+    risk = set_status(db, project_id, risk_id, value.status, value.note.strip() or "사람이 상태를 바꿈")
+    if not risk:
+        raise HTTPException(404, "risk not found")
+    return {"risk": risk}
 
 
 @app.post("/api/projects/{project_id}/investigations/{run_id}/resolve", dependencies=[Depends(authorize)])
@@ -999,6 +1047,10 @@ def resolve_investigation(project_id: str, run_id: str, value: ResolveInput) -> 
     db.put_json("events", record["id"], event, project_id=project_id,
                 fingerprint=record.get("fingerprint"), created_at=record.get("created_at"))
     if applies:
+        from .risk_register import advance_linked
+
+        advance_linked(db, project_id, record["id"], "RESPONDING", "person",
+                       f"사람이 조사 결과를 확인함: {note}", run_id=run_id)
         analysis_run = db.create_run(project_id, "analysis", record["id"], version["id"],
                                      digest({"resolved": run_id, "patch": event["patch"]}),
                                      {"budget_krw": None, "preview_only": False, "resolved_from": run_id,
@@ -1378,6 +1430,8 @@ def usage() -> dict[str, Any]:
     db = store()
     with db.connection() as conn:
         rows = conn.execute("SELECT model, input_tokens, output_tokens, cost_usd, cost_status FROM usage_ledger ORDER BY created_at DESC").fetchall()
+        auto_rows = conn.execute("SELECT created_at FROM auto_usage_ledger WHERE created_at LIKE ?",
+                                 (utcnow()[:10] + "%",)).fetchall()
     items = [dict(row) for row in rows]
     known_cost = sum(item["cost_usd"] or 0 for item in items if item["cost_status"] == "KNOWN")
     return {
@@ -1387,4 +1441,6 @@ def usage() -> dict[str, Any]:
         "paid_calls_enabled": os.environ.get("REPLAN_PAID_CALLS_ENABLED", "false").lower() == "true",
         "llm_mode": llm_mode(),
         "daily_paid_run_limit": int(os.environ.get("REPLAN_MAX_PAID_RUNS_PER_DAY", "20")),
+        "auto_triage_today": len(auto_rows),
+        "daily_auto_triage_limit": int(os.environ.get("REPLAN_MAX_AUTO_TRIAGE_PER_DAY", "20")),
     }

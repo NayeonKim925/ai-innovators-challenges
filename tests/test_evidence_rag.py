@@ -82,6 +82,9 @@ def test_uploaded_document_enters_the_same_cited_evidence_flow(tmp_path):
 class ContractLLM:
     """Exercises the live code path without a provider key or an external model call."""
 
+    def __init__(self, **_settings):
+        """Accepts the adapter's constructor settings, such as a longer read timeout."""
+
     def chat(self, messages, **_kwargs):
         system = str(messages[0].get("content") or "")
         if "Read external evidence" in system:

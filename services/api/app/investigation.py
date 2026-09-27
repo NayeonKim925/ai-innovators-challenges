@@ -168,6 +168,8 @@ def schedule_slack(project: dict[str, Any], tasks: list[dict[str, Any]], task_id
             rows.append({"task_id": task_id, "status": "unknown_task"})
             continue
         low, high = 0, FLOAT_SEARCH_DAYS
+        if finish_with(task_id, 1) != finish:
+            high = 0  # on the critical path: one calculation instead of a full search
         while low < high:
             middle = (low + high + 1) // 2
             if finish_with(task_id, middle) == finish:

@@ -116,3 +116,30 @@ def case_relevance(content: str, risk_id: str) -> dict:
             why = f"통보에 나온 {quoted} → 같은 {KIND_LABEL[kind]} 위험 유형의 실제 사례"
             break
     return {"source_name": record.get("source_name"), "why": why}
+
+
+# The only L2 searches an agent may run: it picks one of these IDs instead of writing a phrase.
+# The stored cases are English and categorised, so a free Korean or English phrase finds nothing.
+CASE_QUERIES = {
+    "export_control": {"label": "수출 통제·선적별 수출 허가", "keywords": "export controls"},
+    "trade": {"label": "무역·통상 정책", "risk_type": "trade"},
+    "permitting": {"label": "인허가·허가", "risk_type": "permitting"},
+    "regulation": {"label": "규제·환경 규정", "risk_type": "regulation"},
+    "labor": {"label": "인력·기술자 투입", "risk_type": "labor"},
+    "logistics": {"label": "물류·공급망", "risk_type": "logistics"},
+    "weather": {"label": "기상·자연재해", "risk_type": "weather"},
+}
+
+
+def search_cases(query: str, as_of: str = "", limit: int = 5) -> dict:
+    """L2 cases for one fixed query ID; cases published after as_of are reference only."""
+    spec = CASE_QUERIES.get(query)
+    if not spec:
+        return {"status": "unknown_query", "queries": sorted(CASE_QUERIES), "results": []}
+    result = search_risk_signals(risk_type=spec.get("risk_type", ""), keywords=spec.get("keywords", ""), limit=limit)
+    for row in result["results"]:
+        later = bool(as_of and str(row.get("published_date") or "") > str(as_of)[:10])
+        row["temporal_status"] = "POST_AS_OF_REFERENCE" if later else "AVAILABLE_AS_OF"
+        row["summary"] = str(row.get("summary") or "")[:200]
+        row.pop("project_stage", None)
+    return {"status": "ok", "query": query, "label": spec["label"], **result}

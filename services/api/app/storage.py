@@ -155,6 +155,16 @@ class Store:
                     created_at TEXT NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS usage_one_attempt_per_run ON usage_ledger(run_id) WHERE run_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS auto_usage_ledger (
+                    id TEXT PRIMARY KEY, run_id TEXT, model TEXT, input_tokens INTEGER,
+                    output_tokens INTEGER, cost_usd REAL, cost_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS auto_usage_one_attempt_per_run ON auto_usage_ledger(run_id) WHERE run_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS risks (
+                    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS risks_by_project ON risks(project_id, created_at);
                 CREATE TABLE IF NOT EXISTS documents (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL
                 );
@@ -189,6 +199,7 @@ class Store:
             "evidence_documents": ("id", "project_id", "source_id", "content_hash", "data", "created_at"),
             "evidence_passages": ("id", "project_id", "document_id", "passage_hash", "data", "created_at"),
             "retrieval_runs": ("id", "project_id", "data", "created_at"),
+            "risks": ("id", "project_id", "data", "created_at"),
             "events": ("id", "project_id", "fingerprint", "data", "created_at"),
             "scenarios": ("id", "project_id", "run_id", "version_id", "data", "created_at"),
             "actions": ("id", "project_id", "event_id", "scenario_id", "data", "created_at"),
@@ -217,7 +228,7 @@ class Store:
             )
 
     def get_json(self, table: str, record_id: str, project_id: str | None = None) -> dict[str, Any] | None:
-        if table not in {"projects", "imports", "versions", "watch_plans", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
+        if table not in {"projects", "imports", "versions", "watch_plans", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "risks", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
             raise ValueError("unsupported table")
         key = "project_id" if table == "watch_plans" else "id"
         query = f"SELECT * FROM {table} WHERE {key}=?"
@@ -234,7 +245,7 @@ class Store:
         return result
 
     def list_json(self, table: str, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
-        if table not in {"versions", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
+        if table not in {"versions", "source_snapshots", "evidence_documents", "evidence_passages", "retrieval_runs", "risks", "events", "runs", "scenarios", "actions", "documents", "mail_accounts", "public_feeds", "supplier_calendars", "notification_channels", "notifications", "site_prep_items"}:
             raise ValueError("unsupported table")
         order_column = "updated_at" if table == "runs" else "created_at"
         if table == "source_snapshots":
@@ -350,7 +361,8 @@ class Store:
             row = db.execute(
                 "SELECT * FROM runs AS candidate WHERE candidate.status='queued' "
                 "AND NOT EXISTS (SELECT 1 FROM runs AS active WHERE active.project_id=candidate.project_id AND active.status='running') "
-                "ORDER BY candidate.created_at LIMIT 1"
+                # A baseline briefing yields to work a person is waiting for.
+                "ORDER BY candidate.kind IN ('baseline_briefing', 'watch_plan_enrich'), candidate.created_at LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
