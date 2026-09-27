@@ -2783,3 +2783,60 @@ details.agent-decision > summary { cursor: pointer; }
 .signal-kind.feed { color: #2f5d73; background: #e3eef4; }
 .watch-feed { margin: 8px 0; font-size: 12px; }
 .watch-feed small { display: block; color: #75807e; margin-top: 2px; }
+
+/* Baseline risk briefing, risk register and change triage */
+.status-chip.danger { background: #fde6e4; color: #9b2f2b; }
+.status-chip.ok { background: #e7f5eb; color: #397356; }
+.briefing { margin-bottom: 16px; }
+.briefing .panel-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.briefing-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 12px; }
+.briefing-risk { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fff; }
+.briefing-head { display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: start; }
+.briefing-head small { display: block; color: var(--muted); margin-top: 2px; }
+.briefing-head .rank { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--deep); color: #fff; font-weight: 800; font-size: 13px; }
+.critical-warning { margin: 8px 0 0; padding: 7px 10px; border-left: 3px solid var(--danger); background: #fdf0ee; border-radius: 6px; font-size: 13px; color: #7c2723; }
+.risk-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+.risk-table th, .risk-table td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #edf0ec; vertical-align: top; }
+.risk-table th { color: var(--muted); font-weight: 700; }
+.risk-table tr.critical td { background: #fdf3f1; }
+.risk-table small { color: var(--muted); }
+.no-attribute { color: #8a5a1f; font-style: normal; font-weight: 700; }
+.added { color: var(--accent); font-style: normal; font-weight: 700; }
+.risk-actions { margin-top: 8px; font-size: 13px; }
+.risk-actions > small { color: var(--muted); font-weight: 700; }
+.risk-actions ul { margin: 4px 0 0; padding-left: 18px; }
+.risk-cases { margin: 8px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+.risk-cases small { color: var(--muted); }
+.agent-note-line { margin: 8px 0 0; font-size: 13px; color: #2f5d73; }
+.coverage-line { margin: 12px 0 0; font-size: 12px; color: #5b4a2c; background: #fff7e8; border-radius: 8px; padding: 8px 10px; }
+.risk-register { margin-top: 16px; }
+.register-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 10px; }
+.register-row { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #fff; font-size: 13px; }
+.register-row.status-occurred, .register-row.status-responding { border-left: 3px solid var(--danger); }
+.register-row.status-signal_detected { border-left: 3px solid var(--warn); }
+.register-head b { margin-right: 6px; }
+.status-track { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; padding: 0; }
+.status-track li { font-size: 11px; padding: 3px 8px; border-radius: 999px; background: #eef1f0; color: #8a948f; }
+.status-track li.past { background: #e3eef4; color: #2f5d73; }
+.status-track li.now { background: var(--deep); color: #fff; font-weight: 800; }
+.history-list-plain { list-style: none; margin: 6px 0; padding: 0; display: grid; gap: 4px; }
+.history-list-plain q { display: block; color: #5b6b70; font-size: 12px; }
+.register-edit { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-top: 6px; }
+.triage { margin-top: 10px; padding: 10px 12px; border: 1px solid #d7dfe6; border-radius: 10px; background: #f7f9fb; font-size: 13px; }
+.triage-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.triage-head small { color: var(--muted); flex-basis: 100%; }
+.triage-buckets { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
+.triage-buckets ul, .triage details ul { margin: 4px 0 0; padding-left: 18px; }
+.triage li span { font-weight: 800; }
+.triage li q { display: block; color: #5b6b70; font-size: 12px; }
+.risk-link { margin: 10px 0; padding: 10px 12px; border: 1px solid #e3b7b3; border-left: 3px solid var(--danger); border-radius: 10px; background: #fff8f7; }
+.risk-link b { display: block; margin: 4px 0; }
+.risk-link p { margin: 4px 0; }
+.risk-link-line { margin: 6px 0 0; font-size: 12px; font-weight: 700; color: #7c2723; }
+@media (max-width: 760px) {
+  .triage-buckets { grid-template-columns: 1fr; }
+  .briefing-head { grid-template-columns: 28px 1fr; }
+  .briefing-head .status-chip { grid-column: 2; justify-self: start; }
+  .risk-table { display: block; overflow-x: auto; }
+}
+.triage li.pickable label { display: inline-flex; gap: 6px; align-items: center; font-weight: 400; }
