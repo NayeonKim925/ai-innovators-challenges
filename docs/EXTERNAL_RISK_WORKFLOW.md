@@ -2,9 +2,9 @@
 
 ## Product scope
 Supplier notices and periodic external monitoring are parallel change triggers. The shared loop is
-Excel upload → agent-proposed monitoring plan and human acceptance → supplier notice on receipt
-or newly detected external change / registered evidence document → retrieve cited passages and
-interpret them → confirm affected tasks (ask if ambiguous) →
+Excel upload → baseline risk briefing and human acceptance of the monitoring plan → watch start →
+supplier notice from the inbox, or a newly detected external change (triaged once automatically) /
+registered evidence document → retrieve cited passages and interpret them → confirm affected tasks (ask if ambiguous) →
 calculate the schedule → recheck holidays and weather across the shifted period → link relevant
 L2 real-case evidence → compare responses → confirm conditions → human approval → revised Excel
 with evidence → continued monitoring. The demo supplier notices are synthetic, but notices are a
@@ -27,8 +27,14 @@ team-approved settings, not a guarantee that a source has published new data.
   is split into immutable, hash-addressed passages and retrieved only against the project schedule,
   risk tags and approved watch terms. The current MVP uses transparent lexical retrieval in SQLite;
   the passage contract is ready for a later vector index.
-- Optional paid LLM interpretation runs before NEEDS_INPUT for public notices and evidence documents.
-  The model receives only retrieved passages with citation IDs. Candidate task IDs must exist, quotes
+- A newly detected registered-source notice with at least one rule candidate is triaged once by the
+  LLM into related / needs check / unrelated, on its own daily limit (`REPLAN_MAX_AUTO_TRIAGE_PER_DAY`).
+  The triage is stored apart from the rule candidates, never starts an investigation and never
+  writes a schedule patch; a notice without rule candidates is marked unrelated without a call.
+- Optional paid LLM interpretation runs before NEEDS_INPUT for public notices and evidence documents
+  when a person starts an analysis; a notice that was already triaged reuses that result.
+  In live mode the model receives retrieved passages with citation IDs (plus the task list,
+  purchase list and risk register for the triage). Candidate task IDs must exist, quotes
   must occur verbatim in a cited passage, and uncited output is discarded. LLM output cannot write
   a schedule patch. Missing dates or applicability require a documented operator decision.
   Existing API_KEY/LLM_MODEL/LLM_BASE_URL and REPLAN_PAID_CALLS_ENABLED gates and usage caps apply.
@@ -74,9 +80,11 @@ planned_cost/currency preservation does not implement total cost forecasting or 
 ## Setup
 1. Import and confirm a schedule with task IDs, dates, dependencies and outdoor flags.
 2. Review the agent-proposed monitoring plan; accept, edit or exclude its sources and conditions.
-3. In 외부 변화 감시, configure coordinates/timezone/thresholds, outdoor tasks and country/year
-   holiday calendars. Register approved public URLs and connect keywords and task candidates.
-4. Enable monitoring and keep the API and worker running. Use 외부 변화 지금 확인 for a manual scan.
+3. On the 감시 (Watch) screen, open 감시 계획 설정 and configure coordinates/timezone/thresholds,
+   outdoor tasks and country/year holiday calendars. Register approved public URLs and connect
+   keywords and task candidates.
+4. Enable monitoring, press 감시 시작, and keep the API and worker running. Use 외부 변화 지금 확인
+   for a manual scan. (In the hero demo, 감시 시작 simulates one collection instead.)
 5. Receive a supplier notice by pasting it into the workspace, upload a public notice/letter, or
    review a change detected by a periodic scan. Public sources and uploaded documents first show
    retrieved citation passages and candidate tasks; both join the same impact-analysis and response flow.

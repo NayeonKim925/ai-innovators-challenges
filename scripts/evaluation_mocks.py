@@ -77,28 +77,20 @@ class MockEvaluationGateway:
         selected = []
         if "셀 설비 제작" in text:
             selected = [row for row in tasks if str(row.get("name") or "").lower() == "cell equipment manufacturing"]
-            quote = "셀 설비 제작"
         elif "모듈 설비 제작" in text:
             selected = [row for row in tasks if str(row.get("name") or "").lower() == "module/pack equipment manufacturing"]
-            quote = "모듈 설비 제작"
         elif "셀 설비 인수시험" in text:
             selected = [row for row in tasks if str(row.get("name") or "").lower() == "factory acceptance test - cell equipment"]
-            quote = "셀 설비 인수시험"
         elif "설비가 현장에 도착" in text:
             selected = [row for row in tasks if str(row.get("name") or "").lower() == "equipment delivery to site"]
-            quote = "설비가 현장에 도착"
         elif "installation" in lowered or "commissioning work" in lowered:
             selected = [row for row in tasks if "equipment installation" in str(row.get("name") or "").lower()]
-            quote = "installation" if "installation" in lowered else "commissioning work"
         elif "clearing trees" in lowered:
             selected = [row for row in tasks if "site preparation" in str(row.get("name") or "").lower()]
-            quote = "clearing trees"
         elif "cell-production lines" in lowered:
             selected = [row for row in tasks if "trial production - cell" in str(row.get("name") or "").lower()]
-            quote = "cell-production lines"
         elif "construction" in lowered and ("labor" in lowered or "funding" in lowered):
             selected = [row for row in tasks if any(word in str(row.get("name") or "").lower() for word in ("foundation", "structural steel"))]
-            quote = "construction"
         else:
             return {"candidates": []}
         # Whole public narrative is always an exact supporting excerpt.

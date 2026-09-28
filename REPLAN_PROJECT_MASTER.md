@@ -10,6 +10,8 @@ competition: "고려대학교 × AWS AI Innovators Challenge"
 
 # RE:PLAN — 개발 시작용 통합 기획·설계 문서
 
+> 2026-09-23 개발 착수 시점의 기획안입니다. 현재 구현과 다른 부분이 있으며, 현재 동작은 [README](README.md)와 [HANDOFF](docs/HANDOFF.md)를 따릅니다.
+
 > **한 문장 정의**  
 > 기업의 프로젝트 엑셀을 등록하면, 프로젝트에 맞는 감시 항목을 설정하고 외부·내부 변화를 조사하여, 실행 가능한 대응 일정과 담당자별 조율 업무로 연결하는 AI 에이전트 서비스.
 
@@ -893,7 +895,7 @@ Scenario:
 
 | 항목 | 값 |
 |---|---|
-| Base URL | `https://52.79.201.46/v1` |
+| Base URL | `https://gateway.example/v1` |
 | 인증 | `Authorization: Bearer <발급된 API_KEY>` |
 | 기본 생성 | `POST /chat/completions` — Base URL 기준 |
 | 모델 조회 | `GET /models` — Base URL 기준 |
@@ -966,7 +968,7 @@ OpenAI SDK를 쓰더라도 요청은 제공된 `base_url`로 보낸다. OpenAI �
 ```dotenv
 # server only; .env.example에는 실제 키를 쓰지 않는다.
 API_KEY=replace_with_organizer_key
-LLM_BASE_URL=https://52.79.201.46/v1
+LLM_BASE_URL=https://gateway.example/v1
 LLM_MODEL=replace_with_an_approved_alias
 LLM_BUDGET_USD=36
 LLM_MAX_STEPS=6
@@ -1007,7 +1009,7 @@ def main() -> int:
         with OpenAI(
             api_key=key,
             base_url=os.environ.get(
-                "LLM_BASE_URL", "https://52.79.201.46/v1"
+                "LLM_BASE_URL", "https://gateway.example/v1"
             ),
             timeout=30.0,
             max_retries=0,

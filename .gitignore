@@ -14,3 +14,6 @@ __pycache__/
 *.pyc
 *.sqlite3
 *.db
+# Real-model evaluation outputs stay local (they hold gateway responses)
+artifacts/agent_evaluation_real*.json
+*.tsbuildinfo
