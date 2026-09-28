@@ -69,7 +69,7 @@ nano .env
 REPLAN_DEMO_TOKEN=긴_임의의_데모_토큰
 REPLAN_CORS_ORIGINS=https://replan.example.com
 REPLAN_ALLOWED_SOURCE_HOSTS=environment.ec.europa.eu
-LLM_BASE_URL=https://52.79.201.46/v1
+LLM_BASE_URL=https://gateway.example/v1
 LLM_MODEL=bedrock-gpt-5.6-terra
 API_KEY=발급받은_LLM_API_KEY
 REPLAN_PAID_CALLS_ENABLED=false

@@ -893,7 +893,7 @@ Scenario:
 
 | 항목 | 값 |
 |---|---|
-| Base URL | `https://52.79.201.46/v1` |
+| Base URL | `https://gateway.example/v1` |
 | 인증 | `Authorization: Bearer <발급된 API_KEY>` |
 | 기본 생성 | `POST /chat/completions` — Base URL 기준 |
 | 모델 조회 | `GET /models` — Base URL 기준 |
@@ -966,7 +966,7 @@ OpenAI SDK를 쓰더라도 요청은 제공된 `base_url`로 보낸다. OpenAI �
 ```dotenv
 # server only; .env.example에는 실제 키를 쓰지 않는다.
 API_KEY=replace_with_organizer_key
-LLM_BASE_URL=https://52.79.201.46/v1
+LLM_BASE_URL=https://gateway.example/v1
 LLM_MODEL=replace_with_an_approved_alias
 LLM_BUDGET_USD=36
 LLM_MAX_STEPS=6
@@ -1007,7 +1007,7 @@ def main() -> int:
         with OpenAI(
             api_key=key,
             base_url=os.environ.get(
-                "LLM_BASE_URL", "https://52.79.201.46/v1"
+                "LLM_BASE_URL", "https://gateway.example/v1"
             ),
             timeout=30.0,
             max_retries=0,
